@@ -76,40 +76,6 @@ mod win {
     pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     pub const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
     pub const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
-    pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
-
-    /// `WriteFile` returning 0 with this error means the operation is
-    /// queued asynchronously — the normal overlapped path.
-    pub const ERROR_IO_PENDING: u32 = 997;
-
-    /// `GetOverlappedResult` with `wait = 0` returns 0 with this error
-    /// while the operation is still running.
-    pub const ERROR_IO_INCOMPLETE: u32 = 996;
-
-    /// Mirrors the Win32 `OVERLAPPED` structure (x86_64 layout).
-    #[repr(C)]
-    pub struct Overlapped {
-        pub internal: usize,
-        pub internal_high: usize,
-        pub offset: u32,
-        pub offset_high: u32,
-        pub _reserved: u32,
-        pub event: Handle,
-    }
-
-    impl Overlapped {
-        pub fn new(offset: u64, event: Handle) -> Overlapped {
-            Overlapped {
-                internal: 0,
-                internal_high: 0,
-                offset: offset as u32,
-                offset_high: (offset >> 32) as u32,
-                _reserved: 0,
-                event,
-            }
-        }
-    }
-
     pub const MEM_COMMIT: u32 = 0x0000_1000;
     pub const MEM_RESERVE: u32 = 0x0000_2000;
     pub const MEM_RELEASE: u32 = 0x0000_8000;
@@ -143,18 +109,6 @@ mod win {
             overlapped: *mut c_void,
         ) -> i32;
         pub fn CloseHandle(object: Handle) -> i32;
-        pub fn CreateEventW(
-            event_attributes: *mut c_void,
-            manual_reset: i32,
-            initial_state: i32,
-            name: *const u16,
-        ) -> Handle;
-        pub fn GetOverlappedResult(
-            file: Handle,
-            overlapped: *mut Overlapped,
-            number_of_bytes_transferred: *mut u32,
-            wait: i32,
-        ) -> i32;
         pub fn FlushFileBuffers(file: Handle) -> i32;
         pub fn SetFilePointerEx(
             file: Handle,
@@ -826,7 +780,7 @@ fn parse_bool(text: &str) -> Option<bool> {
 
 fn print_help() {
     let text = "\
-TextSwell - largetxt-gen 0.3.2
+TextSwell - largetxt-gen 0.3.3
 Generate massive test files that stress large-file text/hex editors.
 
 USAGE:
@@ -915,7 +869,7 @@ fn parse_args() -> Result<Config, (String, i32)> {
                 return Err((String::new(), 0));
             }
             "-V" | "--version" => {
-                return Err(("largetxt-gen 0.3.2\n".to_string(), 0));
+                return Err(("largetxt-gen 0.3.3\n".to_string(), 0));
             }
             "-s" | "--size" => {
                 let v = take_value(&mut i, "--size")?;
@@ -1128,20 +1082,11 @@ impl Drop for AlignedBlock {
 struct OutputFile {
     #[cfg(windows)]
     handle: win::Handle,
-    /// Next overlapped write offset (Windows writes are all overlapped,
-    /// so offsets are explicit rather than pointer-based).
-    #[cfg(windows)]
-    next_offset: u64,
-    /// Outstanding overlapped writes, oldest first: the OVERLAPPED and
-    /// the byte count its completion must report.
-    #[cfg(windows)]
-    pending_os: std::collections::VecDeque<(Box<win::Overlapped>, u32)>,
     #[cfg(not(windows))]
     file: std::fs::File,
-    /// Writes submitted but not yet reaped (non-Windows writes complete
-    /// synchronously inside `begin_write`; this counter just mirrors
-    /// the accounting so `run` is platform-neutral).
-    #[cfg(not(windows))]
+    /// Writes submitted but not yet reaped. Writes are synchronous
+    /// (they complete inside `begin_write` — see the note there), so
+    /// this counter just mirrors the accounting for `run`.
     os_in_flight: usize,
 }
 
@@ -1156,9 +1101,7 @@ impl OutputFile {
         #[cfg(windows)]
         unsafe {
             let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut flags = win::FILE_ATTRIBUTE_NORMAL
-                | win::FILE_FLAG_SEQUENTIAL_SCAN
-                | win::FILE_FLAG_OVERLAPPED;
+            let mut flags = win::FILE_ATTRIBUTE_NORMAL | win::FILE_FLAG_SEQUENTIAL_SCAN;
             if unbuffered {
                 flags |= win::FILE_FLAG_NO_BUFFERING;
             }
@@ -1179,8 +1122,7 @@ impl OutputFile {
             }
             let out = OutputFile {
                 handle,
-                next_offset: 0,
-                pending_os: std::collections::VecDeque::new(),
+                os_in_flight: 0,
             };
             // Zero-fragmentation pre-allocation. Failure is not fatal: some
             // filesystems (FAT, network shares) reject allocation info, and
@@ -1195,21 +1137,6 @@ impl OutputFile {
                     &mut info as *mut win::FileAllocationInfo as *mut std::ffi::c_void,
                     std::mem::size_of::<win::FileAllocationInfo>() as u32,
                 );
-                // Pre-size the end-of-file as well as the allocation.
-                // With overlapped writes this is the difference between
-                // full speed and a crawl: a write that extends the file
-                // is serialized by NTFS to maintain the valid-data
-                // length, which collapses the write queue back to
-                // depth one. Inside a pre-sized EOF every write is a
-                // plain overwrite and they complete concurrently. The
-                // run still truncates to the exact requested size at
-                // the end. Failure is not fatal (the writes extend the
-                // file correctly, just slower).
-                let mut pos: i64 = 0;
-                if win::SetFilePointerEx(handle, alloc_bytes as i64, &mut pos, win::FILE_BEGIN) != 0
-                {
-                    let _ = win::SetEndOfFile(handle);
-                }
                 // Allocation info can move the file pointer on some
                 // filesystems; pin it back to the start.
                 let mut pos: i64 = 0;
@@ -1237,159 +1164,89 @@ impl OutputFile {
         }
     }
 
-    /// Writes every byte of `data` synchronously (non-Windows path;
-    /// Windows writes are all overlapped — see `begin_write`).
-    #[cfg(not(windows))]
+    /// Writes every byte of `data`. With unbuffered I/O the caller
+    /// guarantees `data.len()` is a sector multiple and the
+    /// buffer/offset alignment holds; `WriteFile` may still write
+    /// partially, so loop.
     fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
-        use std::io::Write as _;
-        self.file
-            .write_all(data)
-            .map_err(|e| format!("write failed: {e}"))
-    }
-
-    /// Submits one write of `data` at the current write offset. On
-    /// Windows this issues an overlapped `WriteFile` and returns
-    /// immediately — the caller must keep `data` alive until the write
-    /// is reaped by `finish_oldest`. On other platforms the write
-    /// completes synchronously before this returns.
-    fn begin_write(&mut self, data: &[u8]) -> Result<(), String> {
         #[cfg(windows)]
         unsafe {
-            let event = win::CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null());
-            if event.is_null() {
-                return Err(format!(
-                    "CreateEventW failed (Win32 error {})",
-                    win::last_error()
-                ));
-            }
-            let mut ov = Box::new(win::Overlapped::new(self.next_offset, event));
-            let ok = win::WriteFile(
-                self.handle,
-                data.as_ptr(),
-                data.len() as u32,
-                std::ptr::null_mut(),
-                &mut *ov as *mut win::Overlapped as *mut std::ffi::c_void,
-            );
-            if ok == 0 {
-                let err = win::last_error();
-                if err != win::ERROR_IO_PENDING {
-                    win::CloseHandle(event);
+            let mut written_total = 0usize;
+            while written_total < data.len() {
+                let remaining = data.len() - written_total;
+                let chunk = std::cmp::min(remaining, u32::MAX as usize) as u32;
+                let mut written: u32 = 0;
+                let ok = win::WriteFile(
+                    self.handle,
+                    data.as_ptr().add(written_total),
+                    chunk,
+                    &mut written,
+                    std::ptr::null_mut(),
+                );
+                if ok == 0 {
                     return Err(format!(
-                        "WriteFile failed at offset {} (Win32 error {})",
-                        self.next_offset, err
+                        "WriteFile failed after {written_total} bytes (Win32 error {})",
+                        win::last_error()
                     ));
                 }
+                if written == 0 {
+                    return Err("WriteFile reported 0 bytes written".to_string());
+                }
+                written_total += written as usize;
             }
-            self.next_offset += data.len() as u64;
-            self.pending_os.push_back((ov, data.len() as u32));
             return Ok(());
         }
         #[cfg(not(windows))]
         {
-            self.write_all(data)?;
-            self.os_in_flight += 1;
-            return Ok(());
+            use std::io::Write as _;
+            return self
+                .file
+                .write_all(data)
+                .map_err(|e| format!("write failed: {e}"));
         }
+    }
+
+    /// Submits one write of `data`. The write is synchronous: it
+    /// completes before this returns, on every platform. (An
+    /// overlapped/queued writer was tried in 0.3.1–0.3.2 and measured
+    /// ~2.2x SLOWER on the reference machine — NTFS serializes
+    /// concurrent non-cached writes to one file internally, so the
+    /// queue depth never materialized while every op paid async
+    /// latency. The submit/reap shape stays so `run` keeps one code
+    /// path; reaping a synchronous write is just accounting.)
+    fn begin_write(&mut self, data: &[u8]) -> Result<(), String> {
+        self.write_all(data)?;
+        self.os_in_flight += 1;
+        Ok(())
     }
 
     /// How many submitted writes have not been reaped yet.
     fn in_flight(&self) -> usize {
-        #[cfg(windows)]
-        {
-            return self.pending_os.len();
-        }
-        #[cfg(not(windows))]
-        {
-            return self.os_in_flight;
-        }
+        self.os_in_flight
     }
 
-    /// Waits for the oldest outstanding write to complete and verifies
-    /// it landed in full. Callers recycle the corresponding block only
-    /// after this returns — before that, the kernel may still be
-    /// reading the buffer.
+    /// Reaps the oldest outstanding write. Synchronous writes are
+    /// already complete, so this only settles the accounting (and
+    /// keeps the caller's recycle-after-reap discipline identical
+    /// on every platform).
     fn finish_oldest(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        unsafe {
-            let Some((mut ov, want)) = self.pending_os.pop_front() else {
-                return Ok(());
-            };
-            let mut got: u32 = 0;
-            let ok = win::GetOverlappedResult(
-                self.handle,
-                &mut *ov as *mut win::Overlapped,
-                &mut got,
-                1,
-            );
-            let event = ov.event;
-            win::CloseHandle(event);
-            if ok == 0 {
-                return Err(format!(
-                    "overlapped write failed (Win32 error {})",
-                    win::last_error()
-                ));
-            }
-            if got != want {
-                return Err(format!("overlapped write landed {got} of {want} bytes"));
-            }
-            return Ok(());
-        }
-        #[cfg(not(windows))]
-        {
-            self.os_in_flight = self.os_in_flight.saturating_sub(1);
-            return Ok(());
-        }
+        self.os_in_flight = self.os_in_flight.saturating_sub(1);
+        Ok(())
     }
 
-    /// Non-blocking reap: if the oldest outstanding write has
-    /// completed, reap it (verifying its byte count) and return
-    /// `Some` of the outcome; if it is still running, return `None`
-    /// and leave it queued. Lets the writer feed its queue instead of
-    /// waiting on the drive when more blocks are ready to submit.
+    /// Non-blocking reap: with synchronous writes the oldest write
+    /// is always complete, so this always reaps when one is
+    /// outstanding.
     fn try_finish_oldest(&mut self) -> Option<Result<(), String>> {
-        #[cfg(windows)]
-        unsafe {
-            if self.pending_os.is_empty() {
-                return None;
-            }
-            let (mut ov, want) = self.pending_os.pop_front().expect("checked non-empty");
-            let mut got: u32 = 0;
-            let ok = win::GetOverlappedResult(
-                self.handle,
-                &mut *ov as *mut win::Overlapped,
-                &mut got,
-                0,
-            );
-            if ok == 0 {
-                let err = win::last_error();
-                if err == win::ERROR_IO_INCOMPLETE {
-                    // Still running: put it back at the head.
-                    self.pending_os.push_front((ov, want));
-                    return None;
-                }
-                win::CloseHandle(ov.event);
-                return Some(Err(format!("overlapped write failed (Win32 error {err})")));
-            }
-            win::CloseHandle(ov.event);
-            if got != want {
-                return Some(Err(format!(
-                    "overlapped write landed {got} of {want} bytes"
-                )));
-            }
-            return Some(Ok(()));
+        if self.os_in_flight == 0 {
+            return None;
         }
-        #[cfg(not(windows))]
-        {
-            if self.os_in_flight == 0 {
-                return None;
-            }
-            self.os_in_flight -= 1;
-            return Some(Ok(()));
-        }
+        self.os_in_flight -= 1;
+        Some(Ok(()))
     }
 
-    /// Reaps every outstanding write, ignoring errors. Used on shutdown
-    /// paths so no buffer is freed while the kernel may still touch it.
+    /// Reaps every outstanding write, ignoring errors. Used on
+    /// shutdown paths so the accounting ends at zero.
     fn drain_all(&mut self) {
         while self.in_flight() > 0 {
             let _ = self.finish_oldest();
@@ -2826,11 +2683,10 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
     };
     let hash_thread = std::thread::spawn(move || hasher_loop(gen_rx, hash_tx, digest_tx));
 
-    // Stage 3 — writing, on this thread. Blocks arrive in order; up to
-    // MAX_WRITES_IN_FLIGHT overlapped writes may be outstanding at
-    // once (the drive's queue depth is what turns into throughput on
-    // NVMe). A block returns to the pool only after its write has been
-    // reaped, never before — the kernel may still be reading it.
+    // Stage 3 — writing, on this thread. Blocks arrive in order and
+    // are written synchronously (the fastest measured shape on the
+    // reference machine — see `begin_write`); a block returns to the
+    // pool only after its write has been reaped, never before.
     const MAX_WRITES_IN_FLIGHT: usize = 4;
     let mut pending: std::collections::VecDeque<BlockMsg> = std::collections::VecDeque::new();
     let mut stream_ended = false;
