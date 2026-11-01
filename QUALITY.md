@@ -1,3 +1,40 @@
+# Quality — TextSwell 0.3.0
+
+## 0.3.0 parallel generation — verified (VM), field run owed
+
+- **What changed**: generation split across worker threads; every
+  block generated independently from `range_seed(seed, block index)`;
+  a sequencer restores order and applies null forcing / needle
+  stamping / line counting; claim-ordered block pool (a worker takes
+  its buffer only when its block is the designated next recipient —
+  the earliest unfinished block can never be starved, so the pool
+  cannot deadlock); `--threads <N>` (0 = auto: cores − 2, max 8).
+- **Gate**: 21/21 tests (incl. new `output_does_not_depend_on_thread_count`
+  and a multi-block, multi-worker end-to-end comparison against a
+  sequential reference stream, needle index rows checked), clippy
+  clean, fmt clean.
+- **Design failure found and fixed during this slice**: the first
+  draft handed pool buffers out unordered; at 1 GiB the pool could be
+  hoarded by later blocks while the earliest block's worker waited —
+  a hard stall, reproduced on this VM. Replaced by per-block claims +
+  claim-ordered handout; the same 1 GiB runs then complete.
+- **Benchmarks (honest limits)**: a same-machine A/B against a rebuilt
+  0.2.0 binary (interleaved, median of 3, 1 GiB) showed 1.00–1.05× —
+  this VM's storage is the binding constraint for both versions
+  (dirty-hex identical at 25 MiB/s; system iowait ~73% during runs),
+  so the VM cannot measure the generation gain. The gain targets
+  machines where generation was the ceiling: on the owner's Windows
+  machine the 0.2.0 field run averaged 207.5 MB/s while the write
+  path peaked at 462.5 MB/s. **Field verification of 0.3.0 on that
+  machine is the deciding measurement and is still owed.**
+- **Memory**: resident set ~19 MiB observed during a 1 GiB run with
+  2 generator threads (pool of 8 × 2 MiB + stages) — above 0.2.0's
+  11.2 MiB because the pool now scales with thread count (max 16
+  blocks = 32 MiB of buffers). Still constant in the file size.
+- **Stream change**: per-block seeding means 0.3.0 bytes differ from
+  0.2.0 for every profile at the same seed/settings (documented in
+  the CHANGELOG); determinism within 0.3.0 is test-pinned.
+
 # Quality — TextSwell 0.2.0
 
 ## 0.2.0 speed slice — verified
@@ -23,8 +60,14 @@
   234 → 698 MiB/s, ragged-csv 238 → 598 MiB/s (2.5–3.5× over 0.1.0).
 - **Peak RSS 11.2 MiB** while generating 1 GiB (pool of 4 × 2 MiB).
 - Windows-gnu exe rebuilt from the final tree (456,192 bytes).
-- Still owed: the same run on Sean's Windows machine, where the real
-  ceiling is his CPU + NVMe (his 0.1.0 needle-bench run was 132.2 MB/s).
+- **Field run on the owner's Windows 11 machine (2026-11-01)**: the
+  released 0.2.0 exe repeated the 10 GiB needle-bench run in 0:49 at an
+  average of 207.5 MB/s (peak snapshot 462.5 MB/s), against the 0.1.0
+  runs' 113.6–132.2 MB/s on the same machine — a 1.6–1.8× field gain,
+  with the SHA-256 identical again (`7bd8222a…`), exact size, and 21
+  needle placements + index. The remaining gap to the VM figures is the
+  real unbuffered drive write plus single-threaded generation sharing
+  the ceiling.
 
 ---
 

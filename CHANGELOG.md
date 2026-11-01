@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.0 — 2026-11-01
+
+Parallel generation: more generator threads on the same pipeline.
+
+- **Multi-threaded generation**: generation is split across worker
+  threads (default: auto — two fewer than the core count, up to 8;
+  override with `--threads <N>`). Every 2 MiB block is generated
+  independently from a seed derived from (seed, block index), so the
+  output depends only on the command, never on the machine or the
+  thread count — a test pins byte-identity between 1 and 4 workers.
+  A sequencer stage restores block order and applies the
+  order-sensitive passes (null forcing, needle stamping, line
+  counting) before hashing and writing, exactly as before.
+- **Output stream change (all profiles)**: because content is now
+  seeded per block rather than drawn from one continuous stream, the
+  same seed and settings produce different bytes in 0.3.0 than in
+  0.2.0. Within 0.3.0 the output is fully deterministic, and needle
+  indexes remain exact (`byte_offset` / `line_number` verified
+  end-to-end by the test suite).
+- **Deadlock-free block pool**: pool buffers are handed out in block
+  order, which guarantees the earliest unfinished block can never be
+  starved of a buffer by later blocks finishing early. (An earlier
+  draft of this slice used unordered handout and could stall at
+  large sizes; the shipped design removes that failure mode by
+  construction, and the gate covers multi-block, multi-worker runs.)
+- Memory remains bounded and size-independent: the pool grows with
+  the thread count (threads + 6 blocks, max 16); measured resident
+  set about 19 MiB with two generator threads while writing 1 GiB.
+
 ## 0.2.0 — 2026-11-01
 
 Speed slice: the same bytes, produced much faster.
