@@ -15,14 +15,18 @@
 //!   blocks (allocated once with `VirtualAlloc`), one 16 KiB line-staging
 //!   buffer, and small fixed state. Resident set size stays under 16 MB
 //!   whether the output is 500 MB or 100 GB.
-//! * **Pipelined.** Generation, SHA-256, and writing run on three threads
-//!   connected by bounded channels over the block pool, so the stages
-//!   overlap instead of taking turns. Output bytes are identical to a
-//!   single-threaded run with the same settings: the generator thread is
-//!   the only one that touches the deterministic stream, and blocks stay
-//!   in order through every queue. On x86_64 CPUs with SHA extensions the
-//!   checksum uses hardware SHA-NI rounds (proven byte-equal to the
-//!   software path by the test suite); other CPUs use the software path.
+//! * **Pipelined and parallel.** Generation, SHA-256, and writing run as
+//!   separate stages connected by bounded channels over the block pool,
+//!   and generation itself is split across several worker threads:
+//!   every block is generated independently from a seed derived from
+//!   (seed, block index), so any number of workers produces exactly the
+//!   same bytes — the block layout is a property of the data, not of the
+//!   machine. A sequencer restores block order and
+//!   applies the order-sensitive passes (null forcing, needle stamping)
+//!   before the hasher and writer see each block. On x86_64 CPUs with
+//!   SHA extensions the checksum uses hardware SHA-NI rounds (proven
+//!   byte-equal to the software path by the test suite); other CPUs use
+//!   the software path.
 //! * **Unbuffered, pre-allocated writes on Windows.** `CreateFileW` with
 //!   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN`, NTFS
 //!   pre-allocation through `SetFileInformationByHandle`
@@ -148,9 +152,9 @@ const SECTOR_SIZE: u64 = 4096;
 /// a pool of them fits the memory budget.
 const BLOCK_SIZE: usize = 2 * 1024 * 1024;
 
-/// Number of blocks in the pipeline pool. Three stages (generate, hash,
-/// write) can each hold one while a fourth is in transit.
-const POOL_BLOCKS: usize = 4;
+// Content is seeded per block: block `i` is generated from
+// `range_seed(seed, i)`. The block size therefore fixes what a seed
+// produces — changing BLOCK_SIZE would change every stream.
 
 /// Rounds `n` up to the next multiple of `align` (a power of two).
 fn round_up(n: u64, align: u64) -> u64 {
@@ -684,6 +688,8 @@ struct Config {
     null_rate: f64,
     unbuffered: bool,
     seed: u64,
+    /// Generator worker threads; 0 = auto (see `resolve_threads`).
+    threads: usize,
 }
 
 const DEFAULT_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB
@@ -775,7 +781,7 @@ fn parse_bool(text: &str) -> Option<bool> {
 
 fn print_help() {
     let text = "\
-TextSwell - largetxt-gen 0.2.0
+TextSwell - largetxt-gen 0.3.0
 Generate massive test files that stress large-file text/hex editors.
 
 USAGE:
@@ -799,6 +805,7 @@ OPTIONS:
         --unbuffered <BOOL>  Use FILE_FLAG_NO_BUFFERING on Windows
                              (default: true)
         --seed <HEX>         64-bit hex seed for repeatable output
+        --threads <N>        Generator threads (default: auto; 1-64)
     -h, --help               Show this help
     -V, --version            Show version
 
@@ -825,6 +832,7 @@ fn parse_args() -> Result<Config, (String, i32)> {
     let mut null_rate: f64 = 0.0;
     let mut unbuffered = true;
     let mut seed: u64 = DEFAULT_SEED;
+    let mut threads: usize = 0;
 
     let usage_err = |msg: &str| -> (String, i32) {
         (
@@ -862,7 +870,7 @@ fn parse_args() -> Result<Config, (String, i32)> {
                 return Err((String::new(), 0));
             }
             "-V" | "--version" => {
-                return Err(("largetxt-gen 0.2.0\n".to_string(), 0));
+                return Err(("largetxt-gen 0.3.0\n".to_string(), 0));
             }
             "-s" | "--size" => {
                 let v = take_value(&mut i, "--size")?;
@@ -926,6 +934,14 @@ fn parse_args() -> Result<Config, (String, i32)> {
                     unbuffered = true;
                 }
             }
+            "--threads" => {
+                let v = take_value(&mut i, "--threads")?;
+                threads = v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n <= 64)
+                    .ok_or_else(|| usage_err(&format!("bad --threads '{v}' (want 0-64)")))?;
+            }
             "--seed" => {
                 let v = take_value(&mut i, "--seed")?;
                 seed = parse_seed(&v)
@@ -984,6 +1000,7 @@ fn parse_args() -> Result<Config, (String, i32)> {
         null_rate,
         unbuffered,
         seed,
+        threads,
     })
 }
 
@@ -2093,6 +2110,38 @@ struct NeedleHit {
 /// caller depends on unless the needle itself does, in which case the
 /// recorded line is the line the needle *starts* on, which is the useful
 /// assertion value either way.
+/// Derives the stream seed for one block (or, with a salted base, for
+/// one block's null-forcing stream). A SplitMix64 finalizer over the
+/// base seed mixed with the index: deterministic on every machine, for
+/// every thread count, forever.
+fn range_seed(base: u64, index: u64) -> u64 {
+    let mut z = base ^ index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Salt separating the per-block null-forcing streams from the content
+/// streams, so the two can never correlate.
+const NULL_STREAM_SALT: u64 = 0xE703_7ED1_A0B4_28DB;
+
+/// How many generator workers to run: the flag value when given, else
+/// two fewer than the machine's core count (the hasher and the
+/// writer/sequencer want cores too), clamped to 1..=8.
+fn resolve_threads(cfg: &Config) -> usize {
+    if cfg.threads > 0 {
+        return cfg.threads.min(64);
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if cores >= 4 {
+        (cores - 2).min(8)
+    } else {
+        1
+    }
+}
+
 fn stamp_needles(
     block: &mut [u8],
     block_start: u64,
@@ -2227,6 +2276,91 @@ fn format_duration(secs: f64) -> String {
 // Section 11 — The write loop, progress reporting, sidecar, and summary
 // ===========================================================================
 
+/// The block pool: a fixed set of aligned buffers shared by the whole
+/// pipeline, handed out strictly in block-claim order. That ordering is
+/// the deadlock-freedom argument: block `i`'s worker is always the
+/// designated next recipient, and it takes its buffer before any later
+/// block may take one — so the earliest unfinished block can never be
+/// starved of a buffer by later blocks finishing early and hoarding
+/// the pool (the failure mode of a plain FIFO handout). `put` never
+/// blocks; `close` wakes every waiter with `None` for shutdown.
+struct BlockPool {
+    inner: std::sync::Mutex<BlockPoolInner>,
+    available: std::sync::Condvar,
+}
+
+struct BlockPoolInner {
+    buffers: Vec<AlignedBlock>,
+    /// Next block index allowed to take a buffer.
+    serve: u64,
+    closed: bool,
+}
+
+impl BlockPool {
+    fn new(buffers: Vec<AlignedBlock>) -> BlockPool {
+        BlockPool {
+            inner: std::sync::Mutex::new(BlockPoolInner {
+                buffers,
+                serve: 0,
+                closed: false,
+            }),
+            available: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Takes a buffer for block `index`, waiting until this block is
+    /// the designated recipient and a buffer is free. Returns `None`
+    /// once the pool is closed (shutdown).
+    fn take(&self, index: u64) -> Option<AlignedBlock> {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if g.closed {
+                return None;
+            }
+            if g.serve == index {
+                if let Some(b) = g.buffers.pop() {
+                    g.serve += 1;
+                    // The next designated block may also proceed if
+                    // buffers remain.
+                    self.available.notify_all();
+                    return Some(b);
+                }
+            }
+            g = self
+                .available
+                .wait(g)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Returns a buffer to the pool. Never blocks.
+    fn put(&self, block: AlignedBlock) {
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            g.buffers.push(block);
+        }
+        self.available.notify_all();
+    }
+
+    /// Closes the pool: every current and future `take` returns `None`.
+    fn close(&self) {
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            g.closed = true;
+        }
+        self.available.notify_all();
+    }
+}
+
 struct RunSummary {
     bytes_written: u64,
     elapsed_secs: f64,
@@ -2239,79 +2373,70 @@ struct RunSummary {
 /// content (and are what gets hashed); `write_len` includes any sector
 /// padding on the final block when unbuffered.
 struct BlockMsg {
+    /// Global block index (byte offset / BLOCK_SIZE). Workers finish
+    /// blocks out of order; the sequencer uses this to restore order.
+    index: u64,
     block: AlignedBlock,
     logical: usize,
     write_len: usize,
 }
 
-/// Stage 1 — generation. The only thread that touches the deterministic
-/// stream: fills blocks in order, applies the null-rate pass, stamps
-/// needles (tracking line counts and hits), zero-pads the final block if
-/// unbuffered, and forwards blocks to the hasher. Exits when the stream
-/// is complete, when a channel closes, or when `stop` is set (the writer
-/// sets it after an I/O error so a thread waiting for a free block never
-/// hangs the shutdown).
-fn generator_loop(
+/// Stage 1 — generation workers. Each worker claims the next block
+/// index from the shared atomic counter, generates that block with a
+/// generator seeded for the block (`range_seed`), and sends it to the
+/// sequencer. A block is the unit of work AND the unit of buffering: a
+/// worker needs exactly one pool buffer to finish its claimed block, so
+/// later blocks finishing early can never starve the earliest
+/// unfinished block of a buffer — the pool cannot deadlock. Workers do
+/// pure content generation only: null forcing and needle stamping are
+/// order-sensitive and live in the sequencer. Shutdown is disconnect
+/// driven: when the pool channel closes (the writer is done or has
+/// failed) a worker blocked waiting for a buffer wakes with an error
+/// and exits.
+fn worker_loop(
     cfg: Config,
-    free_rx: std::sync::mpsc::Receiver<AlignedBlock>,
-    out_tx: std::sync::mpsc::SyncSender<BlockMsg>,
-    hits_tx: std::sync::mpsc::Sender<Vec<NeedleHit>>,
+    next_block: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total_blocks: u64,
+    pool: std::sync::Arc<BlockPool>,
+    done_tx: std::sync::mpsc::SyncSender<BlockMsg>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
-    let mut generator = Generator::new(&cfg);
-    let mut hits: Vec<NeedleHit> = Vec::new();
-    let mut needle_carry: usize = 0;
-    let mut lines_before_block: u64 = 0;
-    let mut generated: u64 = 0;
-
-    while generated < cfg.size {
-        // Timed receive so the stop flag can always end this thread.
-        let mut block = loop {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            match free_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(b) => break b,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        };
-        let remaining = cfg.size - generated;
-        let logical = std::cmp::min(remaining, BLOCK_SIZE as u64) as usize;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let index = next_block.fetch_add(1, Ordering::Relaxed);
+        if index >= total_blocks {
+            return;
+        }
+        let block_start = index * BLOCK_SIZE as u64;
+        let logical = std::cmp::min(BLOCK_SIZE as u64, cfg.size - block_start) as usize;
         let write_len = if cfg.unbuffered {
             round_up(logical as u64, SECTOR_SIZE) as usize
         } else {
             logical
         };
+        // The pool hands buffers out in claim order, so this block —
+        // the earliest unfinished one its turn comes to — can never be
+        // starved by later blocks. `None` means shutdown.
+        let mut block = match pool.take(index) {
+            Some(b) => b,
+            None => return,
+        };
         {
+            let mut block_cfg = cfg.clone();
+            block_cfg.seed = range_seed(cfg.seed, index);
+            let mut generator = Generator::new(&block_cfg);
             let buf = block.as_mut_slice();
             generator.fill(&mut buf[..logical]);
-            if cfg.null_rate > 0.0 {
-                // Null forcing runs before needle stamping so a needle is
-                // never erased by the null pass: needles stay findable,
-                // which is the entire point of recording them.
-                apply_null_rate(&mut generator.rng, &mut buf[..logical], cfg.null_rate);
-            }
-            if let Some(needle) = &cfg.needle {
-                stamp_needles(
-                    &mut buf[..logical],
-                    generated,
-                    lines_before_block,
-                    needle,
-                    cfg.needle_every,
-                    &mut hits,
-                    &mut needle_carry,
-                );
-            }
-            lines_before_block += count_newlines(&buf[..logical]);
             if write_len > logical {
                 buf[logical..write_len].fill(0);
             }
         }
-        generated += logical as u64;
-        if out_tx
+        if done_tx
             .send(BlockMsg {
+                index,
                 block,
                 logical,
                 write_len,
@@ -2319,6 +2444,80 @@ fn generator_loop(
             .is_err()
         {
             return;
+        }
+    }
+}
+
+/// Stage 1.5 — the sequencer. Collects blocks from the workers (which
+/// finish out of order), restores strict block order, and applies the
+/// order-sensitive passes in order: null forcing (from a per-block
+/// stream, so it is thread-count independent too), needle stamping with
+/// carry and line counting, then forwards each block to the hasher.
+fn sequencer_loop(
+    cfg: Config,
+    total_blocks: u64,
+    done_rx: std::sync::mpsc::Receiver<BlockMsg>,
+    out_tx: std::sync::mpsc::SyncSender<BlockMsg>,
+    hits_tx: std::sync::mpsc::Sender<Vec<NeedleHit>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut pending: std::collections::BTreeMap<u64, BlockMsg> = std::collections::BTreeMap::new();
+    let mut expected: u64 = 0;
+    let mut hits: Vec<NeedleHit> = Vec::new();
+    let mut needle_carry: usize = 0;
+    let mut lines_before_block: u64 = 0;
+
+    while expected < total_blocks {
+        // Forward the longest in-order run currently buffered.
+        while let Some(mut msg) = pending.remove(&expected) {
+            let block_start = expected * BLOCK_SIZE as u64;
+            {
+                let buf = msg.block.as_mut_slice();
+                if cfg.null_rate > 0.0 {
+                    // Null forcing runs before needle stamping so a needle
+                    // is never erased by the null pass: needles stay
+                    // findable, which is the entire point of recording
+                    // them.
+                    let mut null_rng = Xoshiro256PlusPlus::from_seed(range_seed(
+                        cfg.seed ^ NULL_STREAM_SALT,
+                        expected,
+                    ));
+                    apply_null_rate(&mut null_rng, &mut buf[..msg.logical], cfg.null_rate);
+                }
+                if let Some(needle) = &cfg.needle {
+                    stamp_needles(
+                        &mut buf[..msg.logical],
+                        block_start,
+                        lines_before_block,
+                        needle,
+                        cfg.needle_every,
+                        &mut hits,
+                        &mut needle_carry,
+                    );
+                }
+                lines_before_block += count_newlines(&buf[..msg.logical]);
+            }
+            if out_tx.send(msg).is_err() {
+                return;
+            }
+            expected += 1;
+        }
+        if expected >= total_blocks {
+            break;
+        }
+        match done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(msg) => {
+                pending.insert(msg.index, msg);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
+            // Workers are gone before the stream completed: an error
+            // elsewhere is unwinding the pipeline; just exit.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
     let _ = hits_tx.send(hits);
@@ -2359,35 +2558,55 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
     // The file is created (and pre-allocated) before any thread starts, so
     // a create failure is a plain error return, never a stuck pipeline.
     let mut output = OutputFile::create(&cfg.output_path, cfg.unbuffered, padded_total)?;
+    let gen_threads = resolve_threads(cfg);
 
     eprintln!(
-        "Generating {} ({}, seed 0x{:016x}, eol {}, unbuffered {}) -> {}",
+        "Generating {} ({}, seed 0x{:016x}, eol {}, unbuffered {}, {} gen threads) -> {}",
         format_bytes(cfg.size),
         cfg.profile.name(),
         cfg.seed,
         cfg.eol.name(),
         cfg.unbuffered,
+        gen_threads,
         cfg.output_path
     );
 
-    // Block pool + stage channels. Queue capacities are small: the pool
-    // size is what bounds memory, not the queues.
-    let (free_tx, free_rx) = sync_channel::<AlignedBlock>(POOL_BLOCKS);
-    for _ in 0..POOL_BLOCKS {
-        free_tx
-            .send(AlignedBlock::new(BLOCK_SIZE)?)
-            .map_err(|_| "block pool channel closed during setup".to_string())?;
+    // Block pool + stage channels. The pool grows with the worker count
+    // (one block in each worker's hands, plus pipeline slack); the pool
+    // size is what bounds memory, not the queue capacities.
+    let pool_blocks = (gen_threads + 6).min(16);
+    let total_blocks = cfg.size.div_ceil(BLOCK_SIZE as u64);
+    let mut pool_buffers = Vec::with_capacity(pool_blocks);
+    for _ in 0..pool_blocks {
+        pool_buffers.push(AlignedBlock::new(BLOCK_SIZE)?);
     }
+    let pool = std::sync::Arc::new(BlockPool::new(pool_buffers));
+    let (done_tx, done_rx) = sync_channel::<BlockMsg>(pool_blocks);
     let (gen_tx, gen_rx) = sync_channel::<BlockMsg>(2);
     let (hash_tx, hash_rx) = sync_channel::<BlockMsg>(2);
     let (hits_tx, hits_rx) = channel::<Vec<NeedleHit>>();
     let (digest_tx, digest_rx) = channel::<String>();
     let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let next_block = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let gen_thread = {
+    let mut worker_threads = Vec::new();
+    for _ in 0..gen_threads {
+        let cfg_owned = cfg.clone();
+        let next = next_block.clone();
+        let pool_ref = pool.clone();
+        let done = done_tx.clone();
+        let stop_flag = stop.clone();
+        worker_threads.push(std::thread::spawn(move || {
+            worker_loop(cfg_owned, next, total_blocks, pool_ref, done, stop_flag)
+        }));
+    }
+    drop(done_tx);
+    let seq_thread = {
         let cfg_owned = cfg.clone();
         let stop = stop.clone();
-        std::thread::spawn(move || generator_loop(cfg_owned, free_rx, gen_tx, hits_tx, stop))
+        std::thread::spawn(move || {
+            sequencer_loop(cfg_owned, total_blocks, done_rx, gen_tx, hits_tx, stop)
+        })
     };
     let hash_thread = std::thread::spawn(move || hasher_loop(gen_rx, hash_tx, digest_tx));
 
@@ -2406,7 +2625,7 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
         }
         written += msg.logical as u64;
         let BlockMsg { block, .. } = msg;
-        let _ = free_tx.send(block);
+        pool.put(block);
 
         // Throttled progress: at most once every 100 ms, plus the final
         // state, so the console never becomes the bottleneck.
@@ -2428,13 +2647,17 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
     }
 
     if let Some(e) = write_error {
-        // Cascade the shutdown: flag the generator, drop the hash queue so
-        // the hasher's next send fails, then join both threads before
-        // reporting the error. The generator's timed receive guarantees
-        // it notices the flag even while waiting for a free block.
+        // Cascade the shutdown: flag the workers, drop the hash queue so
+        // the hasher's next send fails, and close the pool so every
+        // worker waiting for a buffer wakes and exits; then join all
+        // threads before reporting the error.
         stop.store(true, Ordering::Relaxed);
         drop(hash_rx);
-        let _ = gen_thread.join();
+        pool.close();
+        for t in worker_threads {
+            let _ = t.join();
+        }
+        let _ = seq_thread.join();
         let _ = hash_thread.join();
         return Err(e);
     }
@@ -2446,8 +2669,12 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
         .map_err(|_| "hash stage ended without a digest".to_string())?;
     let hits = hits_rx
         .recv()
-        .map_err(|_| "generator stage ended without needle results".to_string())?;
-    let _ = gen_thread.join();
+        .map_err(|_| "sequencer stage ended without needle results".to_string())?;
+    pool.close(); // releases any worker still waiting on the pool
+    for t in worker_threads {
+        let _ = t.join();
+    }
+    let _ = seq_thread.join();
     let _ = hash_thread.join();
 
     // Exact final size, undoing both the sector padding and any
@@ -2598,6 +2825,7 @@ mod tests {
             null_rate: 0.0,
             unbuffered: true,
             seed,
+            threads: 1,
         }
     }
 
@@ -2936,13 +3164,45 @@ mod tests {
         );
     }
 
+    /// Builds the expected file bytes for a config the slow, obviously
+    /// correct way: generate each block sequentially with its per-block
+    /// seed, concatenate, then stamp needles over the whole buffer.
+    fn reference_stream(cfg: &Config) -> Vec<u8> {
+        let mut data = vec![0u8; cfg.size as usize];
+        let blocks = cfg.size.div_ceil(BLOCK_SIZE as u64);
+        for b in 0..blocks {
+            let start = (b * BLOCK_SIZE as u64) as usize;
+            let end = std::cmp::min(start + BLOCK_SIZE, data.len());
+            let mut block_cfg = cfg.clone();
+            block_cfg.seed = range_seed(cfg.seed, b);
+            let mut gen = Generator::new(&block_cfg);
+            gen.fill(&mut data[start..end]);
+        }
+        if let Some(needle) = &cfg.needle {
+            let mut hits = Vec::new();
+            let mut carry = 0usize;
+            stamp_needles(
+                &mut data,
+                0,
+                0,
+                needle,
+                cfg.needle_every,
+                &mut hits,
+                &mut carry,
+            );
+            assert_eq!(carry, 0);
+        }
+        data
+    }
+
     #[test]
     fn pipeline_run_matches_reference_stream() {
-        // End-to-end through the real threaded run(): the file on disk
-        // must equal the byte stream produced by sequential generation
-        // with the same settings (the 0.1.0 behaviour), its summary digest
-        // must match a fresh scalar hash of the file, and the needle
-        // index must record the expected placements.
+        // End-to-end through the real parallel run(): the file on disk
+        // must equal the range-by-range reference stream, its summary
+        // digest must match a fresh scalar hash of the file, and the
+        // needle index must record the expected placements. The size
+        // spans ten blocks so several workers have real work and blocks
+        // genuinely finish out of order.
         let dir = std::env::temp_dir();
         let stamp = std::process::id();
         let out_path = dir.join(format!("textswell-pipeline-{stamp}.txt"));
@@ -2950,30 +3210,12 @@ mod tests {
 
         let mut cfg = test_cfg(Profile::NeedleBench, 77);
         cfg.output_path = out_str.clone();
-        cfg.size = 1_234_567;
+        cfg.size = BLOCK_SIZE as u64 * 9 + 3_000_000;
+        cfg.threads = 3;
         cfg.needle = Some(b"TARGET_STRING".to_vec());
-        cfg.needle_every = 100_000;
+        cfg.needle_every = 1_000_000;
 
-        // Reference stream: one sequential pass, same transform order as
-        // the generator stage (fill, stamp, count).
-        let reference = {
-            let mut gen = Generator::new(&cfg);
-            let mut data = vec![0u8; cfg.size as usize];
-            gen.fill(&mut data);
-            let mut hits = Vec::new();
-            let mut carry = 0usize;
-            stamp_needles(
-                &mut data,
-                0,
-                0,
-                cfg.needle.as_deref().unwrap(),
-                cfg.needle_every,
-                &mut hits,
-                &mut carry,
-            );
-            assert_eq!(carry, 0);
-            data
-        };
+        let reference = reference_stream(&cfg);
 
         let summary = run(&cfg).expect("pipeline run failed");
         let on_disk = std::fs::read(&out_path).expect("output missing");
@@ -2983,17 +3225,41 @@ mod tests {
         let mut h = Sha256::with_engine(false);
         h.update(&on_disk);
         assert_eq!(summary.sha256_hex, h.finalize_hex());
-        // Needles at 0, 100k, ..., 1.2M -> 13 placements.
-        assert_eq!(summary.needle_count, 13);
+        // Needles at 0, 1M, ..., 21M -> 22 placements.
+        assert_eq!(summary.needle_count, 22);
         let index_text =
             std::fs::read_to_string(format!("{out_str}.index")).expect("index missing");
         let rows: Vec<&str> = index_text.lines().filter(|l| !l.starts_with('#')).collect();
-        assert_eq!(rows.len(), 13);
+        assert_eq!(rows.len(), 22);
         assert!(rows[0].starts_with("0\t1\tTARGET_STRING"));
-        assert!(rows[12].starts_with("1200000\t"));
+        assert!(rows[21].starts_with("21000000\t"));
 
         let _ = std::fs::remove_file(&out_path);
         let _ = std::fs::remove_file(format!("{out_str}.index"));
+    }
+
+    #[test]
+    fn output_does_not_depend_on_thread_count() {
+        // The block layout is fixed, so 1 worker and 4 workers must
+        // produce byte-identical files (and identical digests) — the
+        // same command gives the same bytes on any machine.
+        let dir = std::env::temp_dir();
+        let stamp = std::process::id();
+        let mut digests = Vec::new();
+        for (tag, threads) in [("one", 1usize), ("many", 4usize)] {
+            let path = dir.join(format!("textswell-threads-{stamp}-{tag}.txt"));
+            let mut cfg = test_cfg(Profile::DenseCode, 99);
+            cfg.output_path = path.to_string_lossy().to_string();
+            cfg.size = BLOCK_SIZE as u64 * 9 + 1_000_000;
+            cfg.threads = threads;
+            let summary = run(&cfg).expect("run failed");
+            digests.push(summary.sha256_hex);
+            let bytes = std::fs::read(&path).expect("output missing");
+            assert_eq!(bytes, reference_stream(&cfg));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}.index", path.to_string_lossy()));
+        }
+        assert_eq!(digests[0], digests[1]);
     }
 
     #[test]
