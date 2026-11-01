@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - run: cargo test --release --target x86_64-pc-windows-msvc
+      - name: Smoke test the Windows binary
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/largetxt-gen.exe"
+          & $exe smoke.txt -s 1234567 -p needle-bench --needle TARGET_STRING --needle-every 500K
+          if ((Get-Item smoke.txt).Length -ne 1234567) { throw "wrong size" }
+          $bytes = [System.IO.File]::ReadAllBytes("smoke.txt")
+          $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+          if (-not $text.Contains("TARGET_STRING")) { throw "needle missing" }
