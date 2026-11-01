@@ -1,3 +1,33 @@
+# Quality — TextSwell 0.2.0
+
+## 0.2.0 speed slice — verified
+
+- **Tests: 20/20 pass**, including two new pins: the SHA-NI engine
+  produces digests identical to the software engine, and the threaded
+  `run()` output is byte-identical to a sequential reference stream
+  (with the needle index contents checked row by row).
+- **Chunk-independence regression test**: `dirty-hex` and `infinite-line`
+  produce identical streams regardless of fill-request slicing. This test
+  was written after an A/B comparison caught `dirty-hex` changing with
+  the pipeline's block size; the profile now generates in fixed 64 KiB
+  segments and `infinite-line` serves from a one-word reservoir.
+- **Cross-version identity (50 MiB per profile, same seed)**: 0.2.0
+  output is byte-identical to 0.1.0 for dense-code, infinite-line,
+  ragged-csv, unicode-stress, and needle-bench (including Sean's
+  field-run settings for needle-bench). `dirty-hex` differs by design —
+  see CHANGELOG 0.2.0.
+- **Throughput on this VM (1 GiB per profile, into the page cache — a
+  CPU-path measurement, not a disk measurement)**: dense-code
+  222 → 709 MiB/s, needle-bench 286 → 985 MiB/s, infinite-line
+  268 → 831 MiB/s, dirty-hex 294 → 1040 MiB/s, unicode-stress
+  234 → 698 MiB/s, ragged-csv 238 → 598 MiB/s (2.5–3.5× over 0.1.0).
+- **Peak RSS 11.2 MiB** while generating 1 GiB (pool of 4 × 2 MiB).
+- Windows-gnu exe rebuilt from the final tree (456,192 bytes).
+- Still owed: the same run on Sean's Windows machine, where the real
+  ceiling is his CPU + NVMe (his 0.1.0 needle-bench run was 132.2 MB/s).
+
+---
+
 # Quality — TextSwell 0.1.0
 
 Gate run by the integrator on the final tree before publish. Labels are

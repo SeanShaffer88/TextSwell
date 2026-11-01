@@ -8,10 +8,11 @@ You run one command and it writes a huge file as fast as your drive can take it,
 
 ## Key features
 
-- **Constant memory** — one 4 MiB write block reused end to end. Generating a 100 GB file uses the same small working set as a 500 MB file (measured peak resident set 11.5 MiB on the reference run).
+- **Constant memory** — a pool of four 2 MiB write blocks reused end to end. Generating a 100 GB file uses the same small working set as a 500 MB file (measured peak resident set 11.2 MiB on the reference run).
 - **Unbuffered, pre-allocated writes on Windows** — `CreateFileW` with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN | FILE_SHARE_READ`, NTFS pre-allocation through `SetFileInformationByHandle` (`FILE_ALLOCATION_INFO`) so the file lands in as few fragments as possible, and 4 KiB-aligned buffers allocated with `VirtualAlloc`.
 - **Exact final size** — unbuffered writes must be whole sectors, so the last block is padded, written, and then cut back to the exact requested byte with `SetFilePointerEx` + `SetEndOfFile`. Ask for 1,234,567 bytes and the file is 1,234,567 bytes.
-- **Deterministic** — an inlined Xoshiro256++ generator driven by `--seed`. Same flags, same bytes, same SHA-256, every run.
+- **Deterministic** — an inlined Xoshiro256++ generator driven by `--seed`. Same flags, same bytes, same SHA-256, every run — and the stream profiles are generated in fixed segments so the bytes cannot change if an internal block size ever does.
+- **Pipelined and hardware-hashed** — generation, SHA-256, and writing run on three threads over the block pool, so the stages overlap; on CPUs with SHA extensions the checksum uses hardware SHA-NI rounds (byte-identical to the software path, proven by tests). Measured 2.5–3.5× faster than the single-threaded 0.1.0 on the reference machine, profile-dependent.
 - **Built-in SHA-256** — the checksum of the written stream is printed at the end, computed while generating (no second read pass).
 - **Live progress** — bytes done / total with a percentage bar, instant and average throughput, elapsed time, and ETA, refreshed every 100 ms using `QueryPerformanceCounter`.
 - **Zero dependencies** — no crates at all. Only the Rust standard library plus direct `kernel32.dll` calls declared in the source.
@@ -103,9 +104,9 @@ Exit codes: `0` success, `1` usage error, `2` I/O error.
 
 ## How it works
 
-- One 4 MiB buffer, page-aligned via `VirtualAlloc`, is filled by the generator and written in a loop. Nothing is allocated per line or per block after startup: line-shaped profiles build one line in a reusable 16 KiB+ staging buffer and copy out of it, so a line can span any number of blocks.
+- Four 2 MiB buffers, page-aligned via `VirtualAlloc`, cycle through a three-stage pipeline: a generator thread fills a buffer, a hashing thread feeds it through SHA-256, and the writer thread writes it and returns it to the pool. Blocks stay in order through every queue, so the output is byte-identical to a single-threaded run. Nothing is allocated per line or per block after startup: line-shaped profiles build one line in a reusable 16 KiB+ staging buffer and copy out of it, so a line can span any number of blocks.
 - The file is pre-allocated to its final (padded) size up front, so the filesystem can place it contiguously.
-- Every block is fed through the built-in SHA-256 before it is written, so the final checksum costs no extra pass.
+- Every block is fed through the built-in SHA-256 (hardware-accelerated when the CPU offers SHA extensions) as it flows to the writer, so the final checksum costs no extra pass.
 - Needles are stamped over the generated stream at exact multiples of `--needle-every` (starting at offset 0), including needles that straddle a block boundary.
 
 ## Tests
@@ -114,7 +115,7 @@ Exit codes: `0` success, `1` usage error, `2` I/O error.
 
 ## Limitations and known issues
 
-- Throughput depends on the drive and the profile. Line-shaped profiles are generator-bound on fast drives; the stream profiles (`infinite-line`, `dirty-hex`) are the ones to use for pure write-bandwidth measurement. Peak NVMe rates (2.5–5.0 GB/s) are a property of the target machine and are not claimed from development-machine measurements.
+- Throughput depends on the drive, the CPU, and the profile. Since 0.2.0 the stages run in parallel, but on a very fast drive the line-shaped profiles can still become generator-bound; the stream profiles (`infinite-line`, `dirty-hex`) are the ones to use for pure write-bandwidth measurement. Peak NVMe rates (2.5–5.0 GB/s) are a property of the target machine and are not claimed from development-machine measurements.
 - On non-Windows hosts the fallback writer cannot request unbuffered I/O; output bytes and sizes are identical, write behaviour is not.
 - `--null-rate` costs one random draw per byte and slows generation while it is active.
 - Very small `--needle-every` values on very large files produce very large `.index` sidecars (one row per needle).
