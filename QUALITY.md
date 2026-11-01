@@ -1,3 +1,21 @@
+# Quality — TextSwell 0.3.3
+
+## 0.3.3 sync-writer revert — verified (VM), field run owed
+
+- **What changed**: the overlapped write path (0.3.1–0.3.2) is
+  removed; the writer is 0.3.0's synchronous `WriteFile` loop again
+  (same submit/reap accounting shape, writes complete at submit).
+  EOF pre-sizing removed with it. Kept: SWAR newline counting,
+  `--threads` auto cap 16, stage queues at 8.
+- **Why**: two field runs put the overlapped versions at 299.1 and
+  287.6 MB/s against the sync version's 640.1 MB/s, output SHA
+  identical every time — the experiment had its answer.
+- **Byte-identity**: A/B vs the 0.3.0 binary at 37 MiB, 10/10 cases
+  identical (files + needle indexes).
+- **Gate**: 22/22 tests, clippy clean host + windows-gnu, fmt clean.
+- **Field verification owed**: the owner's 10 GiB needle-bench
+  should land back at ~0:16 / ~640 MB/s with SHA `b6a6ca0a…`.
+
 # Quality — TextSwell 0.3.2
 
 ## 0.3.2 regression fix — verified (VM), field run owed
@@ -11,9 +29,17 @@
   profiles plus needle+null, threads 1/4, LF, custom line-len:
   identical files and indexes, 10/10.
 - **Gate**: 22/22 tests, clippy clean host + windows-gnu, fmt clean.
-- **Field verification owed**: the deciding run is the owner's
-  10 GiB needle-bench — 0.3.2 must beat 299.1 MB/s (0.3.1) and
-  ideally the 640.1 MB/s 0.3.0 mark, with SHA `b6a6ca0a…` unchanged.
+- **Field run (2026-11-01): diagnosis DISPROVED.** 0:36 at
+  287.6 MB/s — statistically the same as 0.3.1's 299.1, still ~2.2×
+  below 0.3.0's 640.1, with SHA `b6a6ca0a…` identical again.
+  Pre-sizing the EOF changed nothing, so extending writes were not
+  the cause: the overlapped submission path itself is the cost on
+  this machine (NTFS serializes concurrent non-cached writes to one
+  file internally, so the queue depth never materializes, while
+  each overlapped op pays full async-IRP + completion latency the
+  synchronous path avoids). 0.3.3 reverts to 0.3.0's proven
+  synchronous writer, keeping the neutral wins (SWAR counting,
+  thread cap 16, deeper queues).
 
 # Quality — TextSwell 0.3.1
 

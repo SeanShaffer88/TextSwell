@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.3 — 2026-11-01
+
+Revert of the overlapped writer. **Output remains byte-identical to
+0.3.0 for every profile and setting** (verified by direct
+comparison, including needle indexes).
+
+- **Synchronous writer restored**: the 0.3.1/0.3.2 field runs
+  measured 299 and 288 MB/s against 0.3.0's 640 MB/s with identical
+  output, and 0.3.2's pre-sized-EOF fix changed nothing — the
+  overlapped path itself was the cost (NTFS serializes concurrent
+  non-cached writes to one file internally, so the queue depth
+  never materialized while every operation paid asynchronous
+  latency). The writer is back to 0.3.0's synchronous `WriteFile`
+  loop; the `FILE_FLAG_OVERLAPPED` machinery and the EOF pre-sizing
+  are removed.
+- Kept from the 0.3.1/0.3.2 slices, being orthogonal to the
+  regression: SWAR newline counting, the `--threads` auto cap of
+  16, and the deeper stage queues.
+
 ## 0.3.2 — 2026-11-01
 
 Fix for the 0.3.1 field regression. **Output remains byte-identical
