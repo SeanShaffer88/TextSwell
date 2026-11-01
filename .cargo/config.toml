@@ -1,0 +1,5 @@
+# Static CRT on the MSVC target so the shipped exe is a single
+# self-contained file with no VCRUNTIME dependency (V2.0 / portability rule).
+# The GNU target ignores this section.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
