@@ -11,10 +11,18 @@
 //! * **Zero external crates.** Only `std` plus raw `extern "system"`
 //!   declarations against `kernel32.dll`. The SHA-256 implementation and the
 //!   Xoshiro256++ PRNG are written out in this file.
-//! * **Constant memory.** One sector-aligned 4 MiB write block (allocated
-//!   once with `VirtualAlloc`), one 16 KiB line-staging buffer, and small
-//!   fixed state. Resident set size stays under 16 MB whether the output is
-//!   500 MB or 100 GB.
+//! * **Constant memory.** A small pool of sector-aligned 2 MiB write
+//!   blocks (allocated once with `VirtualAlloc`), one 16 KiB line-staging
+//!   buffer, and small fixed state. Resident set size stays under 16 MB
+//!   whether the output is 500 MB or 100 GB.
+//! * **Pipelined.** Generation, SHA-256, and writing run on three threads
+//!   connected by bounded channels over the block pool, so the stages
+//!   overlap instead of taking turns. Output bytes are identical to a
+//!   single-threaded run with the same settings: the generator thread is
+//!   the only one that touches the deterministic stream, and blocks stay
+//!   in order through every queue. On x86_64 CPUs with SHA extensions the
+//!   checksum uses hardware SHA-NI rounds (proven byte-equal to the
+//!   software path by the test suite); other CPUs use the software path.
 //! * **Unbuffered, pre-allocated writes on Windows.** `CreateFileW` with
 //!   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN`, NTFS
 //!   pre-allocation through `SetFileInformationByHandle`
@@ -135,10 +143,14 @@ mod win {
 /// so aligning writes to 4 KiB satisfies `FILE_FLAG_NO_BUFFERING` on both.
 const SECTOR_SIZE: u64 = 4096;
 
-/// Size of the single reusable write block: 4 MiB, a multiple of the sector
-/// size and large enough to keep an NVMe queue saturated with plain
-/// synchronous `WriteFile` calls.
-const BLOCK_SIZE: usize = 4 * 1024 * 1024;
+/// Size of each reusable write block: 2 MiB — inside the 2–4 MB band the
+/// design calls for, a multiple of the sector size, and small enough that
+/// a pool of them fits the memory budget.
+const BLOCK_SIZE: usize = 2 * 1024 * 1024;
+
+/// Number of blocks in the pipeline pool. Three stages (generate, hash,
+/// write) can each hold one while a fourth is in transit.
+const POOL_BLOCKS: usize = 4;
 
 /// Rounds `n` up to the next multiple of `align` (a power of two).
 fn round_up(n: u64, align: u64) -> u64 {
@@ -330,15 +342,34 @@ const SHA256_K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+/// True when this CPU can run the SHA-NI compression path. The software
+/// and hardware paths are interchangeable — the test suite proves they
+/// produce identical digests.
+fn sha_ni_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("sha")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 struct Sha256 {
     state: [u32; 8],
     buffer: [u8; 64],
     buffer_len: usize,
     total_len: u64,
+    use_ni: bool,
 }
 
 impl Sha256 {
     fn new() -> Self {
+        Self::with_engine(sha_ni_supported())
+    }
+
+    fn with_engine(use_ni: bool) -> Self {
         Sha256 {
             state: [
                 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -347,10 +378,24 @@ impl Sha256 {
             buffer: [0u8; 64],
             buffer_len: 0,
             total_len: 0,
+            use_ni: use_ni && sha_ni_supported(),
         }
     }
 
-    fn compress(state: &mut [u32; 8], block: &[u8]) {
+    fn compress(state: &mut [u32; 8], block: &[u8], use_ni: bool) {
+        #[cfg(target_arch = "x86_64")]
+        if use_ni {
+            // SAFETY: `use_ni` is only ever true after
+            // `std::is_x86_feature_detected!("sha")` returned true (see
+            // `with_engine`), and the block is a full 64-byte block, which
+            // every call site guarantees.
+            unsafe { compress_sha_ni(state, block) };
+            return;
+        }
+        Self::compress_scalar(state, block);
+    }
+
+    fn compress_scalar(state: &mut [u32; 8], block: &[u8]) {
         debug_assert_eq!(block.len(), 64);
         let mut w = [0u32; 64];
         for i in 0..16 {
@@ -411,12 +456,12 @@ impl Sha256 {
             data = &data[take..];
             if self.buffer_len == 64 {
                 let block = self.buffer;
-                Self::compress(&mut self.state, &block);
+                Self::compress(&mut self.state, &block, self.use_ni);
                 self.buffer_len = 0;
             }
         }
         while data.len() >= 64 {
-            Self::compress(&mut self.state, &data[..64]);
+            Self::compress(&mut self.state, &data[..64], self.use_ni);
             data = &data[64..];
         }
         if !data.is_empty() {
@@ -446,6 +491,72 @@ impl Sha256 {
             out.push_str(&format!("{word:08x}"));
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hardware SHA-256 compression (x86_64 SHA extensions, a.k.a. SHA-NI).
+//
+// The state juggling mirrors the published Intel formulation: the two
+// state vectors are shuffled into ABEF / CDGH order for
+// `_mm_sha256rnds2_epu32`, the message schedule is extended with
+// `_mm_sha256msg1_epu32` / `_mm_sha256msg2_epu32`, and the result is
+// shuffled back. Two details cost real debugging time and are pinned here:
+// SHA256MSG1 consumes its second operand's lane 0 only (it is the *next*
+// word, not a shifted copy), and the W[i-7] addend comes from
+// `_mm_alignr_epi8(v3, v2, 4)`. Correctness is not asserted from this
+// comment: the test suite checks this path against the FIPS vectors and
+// against the software path on every run where the CPU offers the feature.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sha,ssse3,sse4.1")]
+unsafe fn compress_sha_ni(state: &mut [u32; 8], block: &[u8]) {
+    use std::arch::x86_64::*;
+    // SAFETY: the caller guarantees a full 64-byte block and that the CPU
+    // supports the `sha` feature (runtime-detected). All loads are
+    // unaligned-safe intrinsics over memory the caller owns.
+    unsafe {
+        let mask = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0b, 0x0405_0607_0001_0203);
+        let kptr = SHA256_K.as_ptr() as *const __m128i;
+        let mut s0 = _mm_loadu_si128(state.as_ptr() as *const __m128i);
+        let mut s1 = _mm_loadu_si128(state.as_ptr().add(4) as *const __m128i);
+        let tmp = _mm_shuffle_epi32(s0, 0xB1);
+        s1 = _mm_shuffle_epi32(s1, 0x1B);
+        s0 = _mm_alignr_epi8(tmp, s1, 8); // ABEF
+        s1 = _mm_blend_epi16(s1, tmp, 0xF0); // CDGH
+        let abef_save = s0;
+        let cdgh_save = s1;
+
+        let mut w = [_mm_setzero_si128(); 16];
+        for (i, wi) in w.iter_mut().take(4).enumerate() {
+            *wi = _mm_shuffle_epi8(
+                _mm_loadu_si128(block.as_ptr().add(i * 16) as *const __m128i),
+                mask,
+            );
+        }
+        for round in 0..16 {
+            let t = _mm_add_epi32(w[round], _mm_loadu_si128(kptr.add(round)));
+            s1 = _mm_sha256rnds2_epu32(s1, s0, t);
+            let t2 = _mm_shuffle_epi32(t, 0x0E);
+            s0 = _mm_sha256rnds2_epu32(s0, s1, t2);
+            if round < 12 {
+                let a = w[round];
+                let b = w[round + 1];
+                let c = w[round + 3];
+                let m1 = _mm_sha256msg1_epu32(a, b);
+                let t3 = _mm_add_epi32(m1, _mm_alignr_epi8(c, w[round + 2], 4));
+                w[round + 4] = _mm_sha256msg2_epu32(t3, c);
+            }
+        }
+        s0 = _mm_add_epi32(s0, abef_save);
+        s1 = _mm_add_epi32(s1, cdgh_save);
+        let tmp = _mm_shuffle_epi32(s0, 0x1B);
+        s1 = _mm_shuffle_epi32(s1, 0xB1);
+        s0 = _mm_blend_epi16(tmp, s1, 0xF0);
+        s1 = _mm_alignr_epi8(s1, tmp, 8);
+        _mm_storeu_si128(state.as_mut_ptr() as *mut __m128i, s0);
+        _mm_storeu_si128(state.as_mut_ptr().add(4) as *mut __m128i, s1);
     }
 }
 
@@ -559,6 +670,7 @@ impl Eol {
     }
 }
 
+#[derive(Clone)]
 struct Config {
     output_path: String,
     size: u64,
@@ -663,7 +775,7 @@ fn parse_bool(text: &str) -> Option<bool> {
 
 fn print_help() {
     let text = "\
-TextSwell - largetxt-gen 0.1.0
+TextSwell - largetxt-gen 0.2.0
 Generate massive test files that stress large-file text/hex editors.
 
 USAGE:
@@ -750,7 +862,7 @@ fn parse_args() -> Result<Config, (String, i32)> {
                 return Err((String::new(), 0));
             }
             "-V" | "--version" => {
-                return Err(("largetxt-gen 0.1.0\n".to_string(), 0));
+                return Err(("largetxt-gen 0.2.0\n".to_string(), 0));
             }
             "-s" | "--size" => {
                 let v = take_value(&mut i, "--size")?;
@@ -879,9 +991,9 @@ fn parse_args() -> Result<Config, (String, i32)> {
 // Section 6 — Sector-aligned write block (VirtualAlloc on Windows)
 // ===========================================================================
 
-/// A single 4 MiB buffer whose address is aligned to the 4 KiB page (and
-/// therefore sector) boundary, as `FILE_FLAG_NO_BUFFERING` requires for the
-/// buffer address, the write offset, and the write length.
+/// One pool buffer whose address is aligned to the 4 KiB page (and
+/// therefore sector) boundary, as `FILE_FLAG_NO_BUFFERING` requires for
+/// the buffer address, the write offset, and the write length.
 struct AlignedBlock {
     ptr: *mut u8,
     len: usize,
@@ -1288,6 +1400,12 @@ const FILLER_SENTENCES: &[&str] = &[
     "Bright vixens jump; dozy fowl quack. ",
 ];
 
+/// dirty-hex is generated in fixed-size segments (see `gen_dirty_segment`)
+/// so its byte stream depends only on the seed, never on how the caller
+/// slices its fill requests — a block-size change must not silently change
+/// what a seed produces.
+const DIRTY_SEGMENT: usize = 64 * 1024;
+
 struct Generator {
     rng: Xoshiro256PlusPlus,
     profile: Profile,
@@ -1300,6 +1418,11 @@ struct Generator {
     stage: Vec<u8>,
     stage_len: usize,
     stage_pos: usize,
+    dirty_stage: Vec<u8>,
+    dirty_len: usize,
+    dirty_pos: usize,
+    stream_word: [u8; 8],
+    stream_word_pos: usize,
 }
 
 impl Generator {
@@ -1320,6 +1443,11 @@ impl Generator {
             stage: vec![0u8; stage_cap],
             stage_len: 0,
             stage_pos: 0,
+            dirty_stage: vec![0u8; DIRTY_SEGMENT],
+            dirty_len: 0,
+            dirty_pos: 0,
+            stream_word: [0u8; 8],
+            stream_word_pos: 8, // starts empty: first fill draws a word
         }
     }
 
@@ -1861,33 +1989,57 @@ impl Generator {
     #[allow(clippy::chunks_exact_to_as_chunks)]
     fn fill_infinite_line(&mut self, out: &mut [u8]) {
         // Printable ASCII with no CR or LF anywhere — one line that never
-        // ends, which is what breaks naive line-offset tables.
+        // ends, which is what breaks naive line-offset tables. Bytes are
+        // served from a one-word reservoir so the stream depends only on
+        // the seed, never on how the caller slices its fill requests:
+        // without the reservoir, a fill ending mid-word would discard the
+        // rest of that PRNG word and shift every byte after it.
         const CHARSET: &[u8] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.=+/()[]{}<>;:#@$%!*&|";
         let n = CHARSET.len() as u64;
-        let mut chunks = out.chunks_exact_mut(8);
-        for c in &mut chunks {
-            let v = self.rng.next_u64();
-            for (i, byte) in c.iter_mut().enumerate() {
-                let idx = ((v >> (i * 8)) & 0xFF) % n;
-                *byte = CHARSET[idx as usize];
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.stream_word_pos >= 8 {
+                let v = self.rng.next_u64();
+                for (i, byte) in self.stream_word.iter_mut().enumerate() {
+                    let idx = ((v >> (i * 8)) & 0xFF) % n;
+                    *byte = CHARSET[idx as usize];
+                }
+                self.stream_word_pos = 0;
             }
-        }
-        let rem = chunks.into_remainder();
-        if !rem.is_empty() {
-            let v = self.rng.next_u64();
-            for (i, byte) in rem.iter_mut().enumerate() {
-                let idx = ((v >> (i * 8)) & 0xFF) % n;
-                *byte = CHARSET[idx as usize];
-            }
+            let available = 8 - self.stream_word_pos;
+            let take = std::cmp::min(available, out.len() - written);
+            out[written..written + take].copy_from_slice(
+                &self.stream_word[self.stream_word_pos..self.stream_word_pos + take],
+            );
+            self.stream_word_pos += take;
+            written += take;
         }
     }
 
     // -- dirty-hex ----------------------------------------------------------------
 
     fn fill_dirty_hex(&mut self, out: &mut [u8]) {
+        // Copy out of the segment staging buffer, generating one fixed
+        // 64 KiB segment at a time — the same pattern as the line
+        // profiles, which is what makes the stream block-size independent.
+        let mut written = 0usize;
+        while written < out.len() {
+            if self.dirty_pos >= self.dirty_len {
+                self.gen_dirty_segment();
+            }
+            let available = self.dirty_len - self.dirty_pos;
+            let take = std::cmp::min(available, out.len() - written);
+            out[written..written + take]
+                .copy_from_slice(&self.dirty_stage[self.dirty_pos..self.dirty_pos + take]);
+            self.dirty_pos += take;
+            written += take;
+        }
+    }
+
+    fn gen_dirty_segment(&mut self) {
         // Base layer: raw PRNG bytes (already ~0.4% nulls by chance).
-        self.rng.fill_bytes(out);
+        self.rng.fill_bytes(&mut self.dirty_stage[..]);
         // Sprinkled structures, at irregular intervals, so binary-vs-text
         // heuristics, UTF-8 validators, and hex views all meet edge cases
         // inside a single file: valid UTF-8 fragments, NUL runs, the UTF-8
@@ -1907,12 +2059,14 @@ impl Generator {
             b"\x07\x08\x0b\x0c\x7f",
         ];
         let mut pos = self.rng.below(64) as usize;
-        while pos < out.len() {
+        while pos < self.dirty_stage.len() {
             let pattern = *self.rng.pick(PATTERNS);
-            let take = std::cmp::min(pattern.len(), out.len() - pos);
-            out[pos..pos + take].copy_from_slice(&pattern[..take]);
+            let take = std::cmp::min(pattern.len(), self.dirty_stage.len() - pos);
+            self.dirty_stage[pos..pos + take].copy_from_slice(&pattern[..take]);
             pos += self.rng.range_inclusive(53, 211) as usize;
         }
+        self.dirty_len = self.dirty_stage.len();
+        self.dirty_pos = 0;
     }
 }
 
@@ -2081,42 +2235,48 @@ struct RunSummary {
     index_path: Option<String>,
 }
 
-fn run(cfg: &Config) -> Result<RunSummary, String> {
-    let timer = PerfTimer::new();
-    // Unbuffered writes must be sector multiples in offset and length, so
-    // the physical stream is padded up to a sector boundary and truncated
-    // back to the exact size at the end.
-    let padded_total = if cfg.unbuffered {
-        round_up(cfg.size, SECTOR_SIZE)
-    } else {
-        cfg.size
-    };
+/// One block in flight through the pipeline. `logical` bytes are real
+/// content (and are what gets hashed); `write_len` includes any sector
+/// padding on the final block when unbuffered.
+struct BlockMsg {
+    block: AlignedBlock,
+    logical: usize,
+    write_len: usize,
+}
 
-    let mut output = OutputFile::create(&cfg.output_path, cfg.unbuffered, padded_total)?;
-    let mut block = AlignedBlock::new(BLOCK_SIZE)?;
-    let mut generator = Generator::new(cfg);
-    let mut sha = Sha256::new();
-
+/// Stage 1 — generation. The only thread that touches the deterministic
+/// stream: fills blocks in order, applies the null-rate pass, stamps
+/// needles (tracking line counts and hits), zero-pads the final block if
+/// unbuffered, and forwards blocks to the hasher. Exits when the stream
+/// is complete, when a channel closes, or when `stop` is set (the writer
+/// sets it after an I/O error so a thread waiting for a free block never
+/// hangs the shutdown).
+fn generator_loop(
+    cfg: Config,
+    free_rx: std::sync::mpsc::Receiver<AlignedBlock>,
+    out_tx: std::sync::mpsc::SyncSender<BlockMsg>,
+    hits_tx: std::sync::mpsc::Sender<Vec<NeedleHit>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut generator = Generator::new(&cfg);
     let mut hits: Vec<NeedleHit> = Vec::new();
     let mut needle_carry: usize = 0;
     let mut lines_before_block: u64 = 0;
-
     let mut generated: u64 = 0;
-    let mut last_print_at = f64::NEG_INFINITY;
-    let mut last_print_bytes: u64 = 0;
-    let mut smoothed_rate: f64 = 0.0;
-
-    eprintln!(
-        "Generating {} ({}, seed 0x{:016x}, eol {}, unbuffered {}) -> {}",
-        format_bytes(cfg.size),
-        cfg.profile.name(),
-        cfg.seed,
-        cfg.eol.name(),
-        cfg.unbuffered,
-        cfg.output_path
-    );
 
     while generated < cfg.size {
+        // Timed receive so the stop flag can always end this thread.
+        let mut block = loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            match free_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(b) => break b,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        };
         let remaining = cfg.size - generated;
         let logical = std::cmp::min(remaining, BLOCK_SIZE as u64) as usize;
         let write_len = if cfg.unbuffered {
@@ -2124,7 +2284,6 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
         } else {
             logical
         };
-
         {
             let buf = block.as_mut_slice();
             generator.fill(&mut buf[..logical]);
@@ -2146,21 +2305,116 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
                 );
             }
             lines_before_block += count_newlines(&buf[..logical]);
-            sha.update(&buf[..logical]);
             if write_len > logical {
                 buf[logical..write_len].fill(0);
             }
         }
-        output.write_all(&block.as_slice()[..write_len])?;
         generated += logical as u64;
+        if out_tx
+            .send(BlockMsg {
+                block,
+                logical,
+                write_len,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = hits_tx.send(hits);
+}
+
+/// Stage 2 — hashing. Feeds each block's logical bytes through SHA-256 in
+/// order and forwards the block to the writer. When the input closes it
+/// publishes the final digest and exits.
+fn hasher_loop(
+    in_rx: std::sync::mpsc::Receiver<BlockMsg>,
+    out_tx: std::sync::mpsc::SyncSender<BlockMsg>,
+    digest_tx: std::sync::mpsc::Sender<String>,
+) {
+    let mut sha = Sha256::new();
+    while let Ok(msg) = in_rx.recv() {
+        sha.update(&msg.block.as_slice()[..msg.logical]);
+        if out_tx.send(msg).is_err() {
+            return;
+        }
+    }
+    let _ = digest_tx.send(sha.finalize_hex());
+}
+
+fn run(cfg: &Config) -> Result<RunSummary, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, sync_channel};
+
+    let timer = PerfTimer::new();
+    // Unbuffered writes must be sector multiples in offset and length, so
+    // the physical stream is padded up to a sector boundary and truncated
+    // back to the exact size at the end.
+    let padded_total = if cfg.unbuffered {
+        round_up(cfg.size, SECTOR_SIZE)
+    } else {
+        cfg.size
+    };
+
+    // The file is created (and pre-allocated) before any thread starts, so
+    // a create failure is a plain error return, never a stuck pipeline.
+    let mut output = OutputFile::create(&cfg.output_path, cfg.unbuffered, padded_total)?;
+
+    eprintln!(
+        "Generating {} ({}, seed 0x{:016x}, eol {}, unbuffered {}) -> {}",
+        format_bytes(cfg.size),
+        cfg.profile.name(),
+        cfg.seed,
+        cfg.eol.name(),
+        cfg.unbuffered,
+        cfg.output_path
+    );
+
+    // Block pool + stage channels. Queue capacities are small: the pool
+    // size is what bounds memory, not the queues.
+    let (free_tx, free_rx) = sync_channel::<AlignedBlock>(POOL_BLOCKS);
+    for _ in 0..POOL_BLOCKS {
+        free_tx
+            .send(AlignedBlock::new(BLOCK_SIZE)?)
+            .map_err(|_| "block pool channel closed during setup".to_string())?;
+    }
+    let (gen_tx, gen_rx) = sync_channel::<BlockMsg>(2);
+    let (hash_tx, hash_rx) = sync_channel::<BlockMsg>(2);
+    let (hits_tx, hits_rx) = channel::<Vec<NeedleHit>>();
+    let (digest_tx, digest_rx) = channel::<String>();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+    let gen_thread = {
+        let cfg_owned = cfg.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || generator_loop(cfg_owned, free_rx, gen_tx, hits_tx, stop))
+    };
+    let hash_thread = std::thread::spawn(move || hasher_loop(gen_rx, hash_tx, digest_tx));
+
+    // Stage 3 — writing, on this thread. Blocks arrive in order; each is
+    // written, counted for progress, and returned to the pool.
+    let mut written: u64 = 0;
+    let mut last_print_at = f64::NEG_INFINITY;
+    let mut last_print_bytes: u64 = 0;
+    let mut smoothed_rate: f64 = 0.0;
+    let mut write_error: Option<String> = None;
+
+    while let Ok(msg) = hash_rx.recv() {
+        if let Err(e) = output.write_all(&msg.block.as_slice()[..msg.write_len]) {
+            write_error = Some(e);
+            break;
+        }
+        written += msg.logical as u64;
+        let BlockMsg { block, .. } = msg;
+        let _ = free_tx.send(block);
 
         // Throttled progress: at most once every 100 ms, plus the final
         // state, so the console never becomes the bottleneck.
         let now = timer.elapsed_secs();
-        if now - last_print_at >= 0.100 || generated == cfg.size {
+        if now - last_print_at >= 0.100 || written == cfg.size {
             let dt = now - last_print_at;
             if dt > 0.0 && last_print_at != f64::NEG_INFINITY {
-                let instant = (generated - last_print_bytes) as f64 / dt;
+                let instant = (written - last_print_bytes) as f64 / dt;
                 smoothed_rate = if smoothed_rate == 0.0 {
                     instant
                 } else {
@@ -2168,10 +2422,33 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
                 };
             }
             last_print_at = now;
-            last_print_bytes = generated;
-            print_progress(cfg.size, generated, now, smoothed_rate);
+            last_print_bytes = written;
+            print_progress(cfg.size, written, now, smoothed_rate);
         }
     }
+
+    if let Some(e) = write_error {
+        // Cascade the shutdown: flag the generator, drop the hash queue so
+        // the hasher's next send fails, then join both threads before
+        // reporting the error. The generator's timed receive guarantees
+        // it notices the flag even while waiting for a free block.
+        stop.store(true, Ordering::Relaxed);
+        drop(hash_rx);
+        let _ = gen_thread.join();
+        let _ = hash_thread.join();
+        return Err(e);
+    }
+
+    // Normal completion: the queues have drained and closed. Collect the
+    // digest and the needle hits, then join.
+    let sha256_hex = digest_rx
+        .recv()
+        .map_err(|_| "hash stage ended without a digest".to_string())?;
+    let hits = hits_rx
+        .recv()
+        .map_err(|_| "generator stage ended without needle results".to_string())?;
+    let _ = gen_thread.join();
+    let _ = hash_thread.join();
 
     // Exact final size, undoing both the sector padding and any
     // pre-allocation extension; then make sure the bytes are on disk.
@@ -2209,7 +2486,7 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
     Ok(RunSummary {
         bytes_written: cfg.size,
         elapsed_secs: elapsed,
-        sha256_hex: sha.finalize_hex(),
+        sha256_hex,
         needle_count: hits.len(),
         index_path,
     })
@@ -2601,6 +2878,122 @@ mod tests {
             (40_000..=60_000).contains(&nulls),
             "50% null rate produced {nulls} nulls"
         );
+    }
+
+    #[test]
+    fn stream_profiles_do_not_depend_on_fill_chunking() {
+        // The same seed must produce the same stream no matter how the
+        // caller slices its fill requests — the pipeline's block size is
+        // an I/O detail, not part of the data format.
+        for profile in [Profile::DirtyHex, Profile::InfiniteLine] {
+            let cfg = test_cfg(profile, 31);
+            let mut whole_gen = Generator::new(&cfg);
+            let mut whole = vec![0u8; 200_000];
+            whole_gen.fill(&mut whole);
+            let mut pieces_gen = Generator::new(&cfg);
+            let mut pieces = Vec::with_capacity(200_000);
+            let mut sizes = [1usize, 7, 1000, 65_536, 3, 8192].iter().cycle();
+            while pieces.len() < 200_000 {
+                let take = std::cmp::min(*sizes.next().unwrap(), 200_000 - pieces.len());
+                let start = pieces.len();
+                pieces.resize(pieces.len() + take, 0);
+                pieces_gen.fill(&mut pieces[start..]);
+            }
+            assert_eq!(whole, pieces, "{} depends on fill chunking", profile.name());
+        }
+    }
+
+    #[test]
+    fn sha_engines_agree() {
+        // The hardware path must be byte-identical to the software path.
+        // Data comes from the generator so it is realistic, non-uniform,
+        // and fed in awkward chunk sizes to exercise buffering in both.
+        let data = generate(Profile::DirtyHex, 1234, 300_000);
+        let digest_with = |engine: bool| {
+            let mut h = Sha256::with_engine(engine);
+            let mut pos = 0usize;
+            while pos < data.len() {
+                let take = std::cmp::min(997, data.len() - pos);
+                h.update(&data[pos..pos + take]);
+                pos += take;
+            }
+            h.finalize_hex()
+        };
+        let scalar = digest_with(false);
+        if sha_ni_supported() {
+            assert_eq!(scalar, digest_with(true), "SHA-NI != scalar SHA-256");
+        } else {
+            // Without the feature the request for the NI engine must fall
+            // back silently and still be correct.
+            assert_eq!(scalar, digest_with(true));
+        }
+        // And the scalar path still matches the FIPS vector.
+        let mut h = Sha256::with_engine(false);
+        h.update(b"abc");
+        assert_eq!(
+            h.finalize_hex(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn pipeline_run_matches_reference_stream() {
+        // End-to-end through the real threaded run(): the file on disk
+        // must equal the byte stream produced by sequential generation
+        // with the same settings (the 0.1.0 behaviour), its summary digest
+        // must match a fresh scalar hash of the file, and the needle
+        // index must record the expected placements.
+        let dir = std::env::temp_dir();
+        let stamp = std::process::id();
+        let out_path = dir.join(format!("textswell-pipeline-{stamp}.txt"));
+        let out_str = out_path.to_string_lossy().to_string();
+
+        let mut cfg = test_cfg(Profile::NeedleBench, 77);
+        cfg.output_path = out_str.clone();
+        cfg.size = 1_234_567;
+        cfg.needle = Some(b"TARGET_STRING".to_vec());
+        cfg.needle_every = 100_000;
+
+        // Reference stream: one sequential pass, same transform order as
+        // the generator stage (fill, stamp, count).
+        let reference = {
+            let mut gen = Generator::new(&cfg);
+            let mut data = vec![0u8; cfg.size as usize];
+            gen.fill(&mut data);
+            let mut hits = Vec::new();
+            let mut carry = 0usize;
+            stamp_needles(
+                &mut data,
+                0,
+                0,
+                cfg.needle.as_deref().unwrap(),
+                cfg.needle_every,
+                &mut hits,
+                &mut carry,
+            );
+            assert_eq!(carry, 0);
+            data
+        };
+
+        let summary = run(&cfg).expect("pipeline run failed");
+        let on_disk = std::fs::read(&out_path).expect("output missing");
+        assert_eq!(on_disk.len() as u64, cfg.size);
+        assert_eq!(on_disk, reference, "pipeline bytes differ from reference");
+
+        let mut h = Sha256::with_engine(false);
+        h.update(&on_disk);
+        assert_eq!(summary.sha256_hex, h.finalize_hex());
+        // Needles at 0, 100k, ..., 1.2M -> 13 placements.
+        assert_eq!(summary.needle_count, 13);
+        let index_text =
+            std::fs::read_to_string(format!("{out_str}.index")).expect("index missing");
+        let rows: Vec<&str> = index_text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(rows.len(), 13);
+        assert!(rows[0].starts_with("0\t1\tTARGET_STRING"));
+        assert!(rows[12].starts_with("1200000\t"));
+
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(format!("{out_str}.index"));
     }
 
     #[test]
