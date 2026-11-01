@@ -2,7 +2,14 @@
 <!-- TextSwell (largetxt-gen) MSI source, built with wixl (msitools)
      using the x64 architecture flag.
      The File Source paths are relative to the staging directory the build
-     runs in (largetxt-gen.exe, README.md, LICENSE staged together). -->
+     runs in (largetxt-gen.exe, README.md, LICENSE staged together).
+     NOTE (2026-11-01): wixl 0.103 cannot build the WiX <Environment>
+     element (it aborts with "unhandled child Component node
+     Environment"), so the system-PATH registration the NSIS installer
+     performs is added to the built MSI as a post-build step: dump the
+     MSI with msidump, add the Environment.idt row
+     (InstallFolderOnPath / *PATH / [~];[INSTALLFOLDER] /
+     MainExecutable), and import it back with msibuild. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="TextSwell" Language="1033" Version="0.3.3"
            Manufacturer="Sean Shaffer"
