@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.1 — 2026-11-01
+
+Write-path slice: same bytes, deeper write queue. **Output is
+byte-identical to 0.3.0 for every profile and setting** (verified by
+direct comparison, including needle indexes).
+
+- **Overlapped writes on Windows**: the output file is opened with
+  `FILE_FLAG_OVERLAPPED` and the writer keeps up to four writes in
+  flight instead of waiting for each 2 MiB write to finish before
+  starting the next — NVMe drives need queue depth to reach full
+  sequential bandwidth. A buffer returns to the pool only after its
+  write has been reaped, and shutdown paths drain every outstanding
+  write before anything is freed.
+- **Faster line counting**: the sequencer's per-block newline count
+  (which feeds needle line numbers) now uses a SWAR word-at-a-time
+  scan instead of a byte loop, with an adversarial-content test
+  pinning it against the naive count.
+- **Higher auto thread cap**: `--threads` auto now allows up to 16
+  generator threads (cores − 2), for many-core machines.
+
 ## 0.3.0 — 2026-11-01
 
 Parallel generation: more generator threads on the same pipeline.

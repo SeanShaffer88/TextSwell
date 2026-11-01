@@ -1,3 +1,23 @@
+# Quality — TextSwell 0.3.1
+
+## 0.3.1 write-path slice — verified (VM), field run owed
+
+- **What changed**: Windows output handle is now overlapped; the
+  writer keeps up to 4 writes in flight and recycles a buffer only
+  after its write is reaped (error paths drain all outstanding
+  writes first). Sequencer newline counting is SWAR (word-at-a-time).
+  Auto thread cap raised 8 → 16.
+- **Byte-identity vs 0.3.0 (the point of the slice)**: direct A/B on
+  this VM at 37 MiB — all six profiles plus needle+null-rate,
+  threads 1 and 4, LF eol, and custom line-len cases: file SHA-256
+  and `.index` contents identical in all 10 cases.
+- **Gate**: 22/22 tests (incl. new SWAR adversarial-count test),
+  clippy clean on host and windows-gnu targets, fmt clean. The
+  Windows overlapped path compiles and links here; its runtime
+  behaviour is **Unverified until the owner's field run** — the
+  deciding numbers are his 10 GiB needle-bench (0.3.0 field mark:
+  0:16, 640.1 MB/s) and the exact-size/index checks in the summary.
+
 # Quality — TextSwell 0.3.0
 
 ## 0.3.0 parallel generation — verified (VM), field run owed
@@ -34,6 +54,14 @@
 - **Stream change**: per-block seeding means 0.3.0 bytes differ from
   0.2.0 for every profile at the same seed/settings (documented in
   the CHANGELOG); determinism within 0.3.0 is test-pinned.
+- **Field run on the owner's Windows 11 machine (2026-11-01)**: the
+  0.3.0 exe repeated the 10 GiB needle-bench run in 0:16 at an average
+  of 640.1 MB/s with 8 generator threads (auto) — 3.1× the 0.2.0
+  field run (0:49, 207.5 MB/s), exact size, 21 needle placements +
+  index, stream SHA-256 `b6a6ca0a…`. Parallel generation is therefore
+  field-verified as the right lever; the remaining known ceilings are
+  the synchronous single-write path (queue depth 1) and the
+  sequencer's per-block newline scan, both addressed in 0.3.1.
 
 # Quality — TextSwell 0.2.0
 

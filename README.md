@@ -12,7 +12,7 @@ You run one command and it writes a huge file as fast as your drive can take it,
 - **Unbuffered, pre-allocated writes on Windows** — `CreateFileW` with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN | FILE_SHARE_READ`, NTFS pre-allocation through `SetFileInformationByHandle` (`FILE_ALLOCATION_INFO`) so the file lands in as few fragments as possible, and 4 KiB-aligned buffers allocated with `VirtualAlloc`.
 - **Exact final size** — unbuffered writes must be whole sectors, so the last block is padded, written, and then cut back to the exact requested byte with `SetFilePointerEx` + `SetEndOfFile`. Ask for 1,234,567 bytes and the file is 1,234,567 bytes.
 - **Deterministic** — an inlined Xoshiro256++ generator driven by `--seed`. Same flags, same bytes, same SHA-256, every run — and the stream profiles are generated in fixed segments so the bytes cannot change if an internal block size ever does.
-- **Parallel generation, pipelined and hardware-hashed** — several generator threads produce blocks concurrently (each block is seeded independently, so any thread count produces identical bytes), while SHA-256 and writing run as their own pipeline stages; on CPUs with SHA extensions the checksum uses hardware SHA-NI rounds (byte-identical to the software path, proven by tests). `--threads <N>` controls the generator count (default: auto).
+- **Parallel generation, pipelined and hardware-hashed** — several generator threads produce blocks concurrently (each block is seeded independently, so any thread count produces identical bytes), while SHA-256 and overlapped writing run as their own pipeline stages; on CPUs with SHA extensions the checksum uses hardware SHA-NI rounds (byte-identical to the software path, proven by tests). `--threads <N>` controls the generator count (default: auto).
 - **Built-in SHA-256** — the checksum of the written stream is printed at the end, computed while generating (no second read pass).
 - **Live progress** — bytes done / total with a percentage bar, instant and average throughput, elapsed time, and ETA, refreshed every 100 ms using `QueryPerformanceCounter`.
 - **Zero dependencies** — no crates at all. Only the Rust standard library plus direct `kernel32.dll` calls declared in the source.
@@ -98,14 +98,14 @@ Sizes accept `K`, `M`, `G`, `T` suffixes (binary: `1G` = 1 GiB), an optional tra
 | `--null-rate <PCT>` | Percent of bytes forced to `0x00` (0.0–100.0). Applied before needle stamping, so needles stay findable | `0` |
 | `--unbuffered <BOOL>` | `FILE_FLAG_NO_BUFFERING` on Windows | `true` |
 | `--seed <HEX>` | 64-bit hex seed for repeatable output | `0x5EED5EED5EED5EED` |
-| `--threads <N>` | Generator threads, 1–64 (0 = auto: cores − 2, max 8) | auto |
+| `--threads <N>` | Generator threads, 1–64 (0 = auto: cores − 2, max 16) | auto |
 | `-h, --help` / `-V, --version` | Help / version | |
 
 Exit codes: `0` success, `1` usage error, `2` I/O error.
 
 ## How it works
 
-- A bounded pool of 2 MiB buffers, page-aligned via `VirtualAlloc`, cycles through the pipeline: generator worker threads fill buffers (each block from its own derived seed, so the file is identical no matter how many workers run), a sequencer restores block order and applies needle stamping and null forcing, a hashing thread feeds each block through SHA-256, and the writer thread writes it and returns it to the pool. The pool hands buffers out in block order, so an early block can never be starved by later blocks finishing first. Nothing is allocated per line after startup: line-shaped profiles build one line in a reusable 16 KiB+ staging buffer and copy out of it.
+- A bounded pool of 2 MiB buffers, page-aligned via `VirtualAlloc`, cycles through the pipeline: generator worker threads fill buffers (each block from its own derived seed, so the file is identical no matter how many workers run), a sequencer restores block order and applies needle stamping and null forcing, a hashing thread feeds each block through SHA-256, and the writer keeps up to four overlapped writes in flight, returning each buffer to the pool only when its write completes. The pool hands buffers out in block order, so an early block can never be starved by later blocks finishing first. Nothing is allocated per line after startup: line-shaped profiles build one line in a reusable 16 KiB+ staging buffer and copy out of it.
 - The file is pre-allocated to its final (padded) size up front, so the filesystem can place it contiguously.
 - Every block is fed through the built-in SHA-256 (hardware-accelerated when the CPU offers SHA extensions) as it flows to the writer, so the final checksum costs no extra pass.
 - Needles are stamped over the generated stream at exact multiples of `--needle-every` (starting at offset 0), including needles that straddle a block boundary.
