@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- TextSwell (largetxt-gen) MSI source, built with wixl (msitools)
+     using the x64 architecture flag.
+     The File Source paths are relative to the staging directory the build
+     runs in (largetxt-gen.exe, README.md, LICENSE staged together). -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="TextSwell" Language="1033" Version="0.2.0"
+           Manufacturer="Sean Shaffer"
+           UpgradeCode="FE91485B-A18B-4564-B9CE-DDE488D19E43">
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"
+             Description="largetxt-gen - massive test-file generator" />
+    <MediaTemplate EmbedCab="yes" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of TextSwell is already installed." />
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="TextSwell">
+          <Component Id="MainExecutable" Guid="9D68FA15-4184-4BD1-9CD4-2F202BE0D19A">
+            <File Id="LargeTxtGenExe" Name="largetxt-gen.exe" Source="largetxt-gen.exe" KeyPath="yes" />
+            <File Id="ReadmeFile" Name="README.md" Source="README.md" />
+            <File Id="LicenseFile" Name="LICENSE" Source="LICENSE" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+    <Feature Id="MainFeature" Title="TextSwell" Level="1">
+      <ComponentRef Id="MainExecutable" />
+    </Feature>
+  </Product>
+</Wix>
