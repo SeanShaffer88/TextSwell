@@ -2,43 +2,43 @@
 
 ## 0.3.3 — 2026-11-01
 
-Revert of the overlapped writer. **Output remains byte-identical to
-0.3.0 for every profile and setting** (verified by direct
-comparison, including needle indexes).
+Writer reverted to the synchronous path. **Output remains
+byte-identical to 0.3.0 for every profile and setting** (verified by
+direct comparison, including needle indexes).
 
-- **Synchronous writer restored**: the 0.3.1/0.3.2 field runs
-  measured 299 and 288 MB/s against 0.3.0's 640 MB/s with identical
-  output, and 0.3.2's pre-sized-EOF fix changed nothing — the
-  overlapped path itself was the cost (NTFS serializes concurrent
-  non-cached writes to one file internally, so the queue depth
-  never materialized while every operation paid asynchronous
-  latency). The writer is back to 0.3.0's synchronous `WriteFile`
-  loop; the `FILE_FLAG_OVERLAPPED` machinery and the EOF pre-sizing
-  are removed.
-- Kept from the 0.3.1/0.3.2 slices, being orthogonal to the
-  regression: SWAR newline counting, the `--threads` auto cap of
-  16, and the deeper stage queues.
+- **Synchronous writer restored**: the `FILE_FLAG_OVERLAPPED` write
+  queue from 0.3.1/0.3.2 is removed; the writer is 0.3.0's
+  synchronous `WriteFile` loop again, and 0.3.2's EOF pre-sizing is
+  removed with it. Reason: the test runs that appeared to indict
+  the overlapped writer were later found — by a `--version` check —
+  to have executed the 0.3.0 binary (the newer executables never
+  reached the test folder), so that comparison was never valid.
+  With the question unresolved, the release keeps the writer whose
+  behaviour is proven. Details in QUALITY.md.
+- Kept from the 0.3.1/0.3.2 slices: SWAR newline counting, the
+  `--threads` auto cap of 16, and the deeper stage queues.
+- Field-verified on Windows 11 with the executable's identity
+  confirmed before the run: exact size, expected SHA-256, 21 needle
+  placements; 302.9 MB/s in the drive's sustained-write state.
 
 ## 0.3.2 — 2026-11-01
 
-Fix for the 0.3.1 field regression. **Output remains byte-identical
-to 0.3.0/0.3.1 for every profile and setting** (verified by direct
-comparison, including needle indexes).
+**Output remains byte-identical to 0.3.0/0.3.1 for every profile
+and setting** (verified by direct comparison, including needle
+indexes).
 
-- **Pre-sized end-of-file on Windows**: 0.3.1's field run was slower
-  than 0.3.0 (299 vs 640 MB/s) despite correct output. Cause: the
-  file's end-of-file was still 0 when writing began (only its
-  allocation was pre-set), so every overlapped write extended the
-  file — and NTFS serializes extending writes to maintain the
-  valid-data length, collapsing the write queue to depth one. The
-  file is now sized to its final padded length at creation, so
-  writes are plain overwrites that complete concurrently; the run
-  still truncates to the exact requested size at the end. (Side
-  effect: the file shows its full size from the start.)
-- **Non-blocking reap first**: the writer now checks for completed
+- **Pre-sized end-of-file on Windows**: written in response to test
+  runs that appeared to show 0.3.1 slower than 0.3.0; those runs
+  were later found to have executed the 0.3.0 binary, so the
+  premise was never verified (see the 0.3.3 note). The change
+  itself: the file is sized to its final padded length at creation,
+  so overlapped writes are plain overwrites instead of
+  file-extending writes; the run still truncates to the exact
+  requested size at the end. (Side effect: the file shows its full
+  size from the start.) Superseded by 0.3.3.
+- **Non-blocking reap first**: the writer checks for completed
   writes without waiting, and only blocks on a reap when the stream
-  has ended or the queue is full — previously it could wait on the
-  drive while finished blocks sat unsubmitted.
+  has ended or the queue is full.
 - Deeper sequencer/hasher queues (2 → 8 blocks of slack).
 
 ## 0.3.1 — 2026-11-01

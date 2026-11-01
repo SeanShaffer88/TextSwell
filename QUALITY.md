@@ -13,9 +13,15 @@
 - **Byte-identity**: A/B vs the 0.3.0 binary at 37 MiB, 10/10 cases
   identical (files + needle indexes).
 - **Gate**: 22/22 tests, clippy clean host + windows-gnu, fmt clean.
-- **Field verification owed**: the owner's 10 GiB needle-bench
-  should land back at ~0:16 / ~640 MB/s with SHA `b6a6ca0a…`.
-
+- **Field run (2026-11-01, identity-verified)**: run with a
+  distinctly named executable after a `--version` check printed
+  0.3.3: 0:34 at 302.9 MB/s, 14 generator threads (auto on a
+  16-logical-processor machine), SHA `b6a6ca0a…` identical, exact
+  size, 21 needles. The number sits in the drive's sustained-write
+  cluster (~290–303 MB/s after repeated 10 GiB writes; ~530–640
+  rested) documented in the 0.3.1 section — correctness is
+  field-verified; a rested-state figure for 0.3.3 specifically is
+  not claimed.
 # Quality — TextSwell 0.3.2
 
 ## 0.3.2 regression fix — verified (VM), field run owed
@@ -29,18 +35,11 @@
   profiles plus needle+null, threads 1/4, LF, custom line-len:
   identical files and indexes, 10/10.
 - **Gate**: 22/22 tests, clippy clean host + windows-gnu, fmt clean.
-- **Field run (2026-11-01): diagnosis DISPROVED.** 0:36 at
-  287.6 MB/s — statistically the same as 0.3.1's 299.1, still ~2.2×
-  below 0.3.0's 640.1, with SHA `b6a6ca0a…` identical again.
-  Pre-sizing the EOF changed nothing, so extending writes were not
-  the cause: the overlapped submission path itself is the cost on
-  this machine (NTFS serializes concurrent non-cached writes to one
-  file internally, so the queue depth never materializes, while
-  each overlapped op pays full async-IRP + completion latency the
-  synchronous path avoids). 0.3.3 reverts to 0.3.0's proven
-  synchronous writer, keeping the neutral wins (SWAR counting,
-  thread cap 16, deeper queues).
-
+- **Field attribution correction (2026-11-01)**: the run recorded
+  here earlier (0:36, 287.6 MB/s) executed the 0.3.0 binary, not
+  0.3.2 — see the 0.3.1 section. 0.3.2 was never field-run, and no
+  conclusion about the pre-sizing change survives; 0.3.3 removed
+  it together with the overlapped writer.
 # Quality — TextSwell 0.3.1
 
 ## 0.3.1 write-path slice — verified (VM), field run owed
@@ -56,18 +55,22 @@
   and `.index` contents identical in all 10 cases.
 - **Gate**: 22/22 tests (incl. new SWAR adversarial-count test),
   clippy clean on host and windows-gnu targets, fmt clean.
-- **Field run (2026-11-01): correctness pass, speed REGRESSION.**
-  Output SHA-256 `b6a6ca0a…` — identical to the 0.3.0 run, exact
-  size, 21 needles: the byte-identity promise held in the field.
-  But the run took 0:34 at 299.1 MB/s against 0.3.0's 0:16 /
-  640.1 MB/s. Diagnosis: the file's end-of-file was still 0 at
-  create (only allocation was pre-set), so every overlapped write
-  was an *extending* write; NTFS serializes those to maintain the
-  valid-data length across concurrent writes, collapsing the queue
-  depth the slice was built to create (plus the writer reaped
-  blocking-style, starving its own queue). 0.3.2 pre-sizes the EOF
-  at create and makes reaping non-blocking-first.
-
+- **Field attribution correction (2026-11-01)**: the runs
+  recorded here earlier as 0.3.1's (0:34, 299.1 MB/s, SHA
+  `b6a6ca0a…`) in fact executed the **0.3.0** binary. Proof: the
+  test folder contained only `largetxt-gen.exe` at 469,504 bytes
+  (the 0.3.0 build), `--version` printed 0.3.0, and no renamed
+  copies of the newer builds existed — the 0.3.1/0.3.2/0.3.3
+  attachments never reached that folder. 0.3.1 was therefore never
+  field-run, and every speed comparison from that session is
+  withdrawn: the five runs of the 0.3.0 binary (640.1, 299.1,
+  287.6, 532.9, 290.1 MB/s) instead document the test drive's
+  bimodal behaviour — ~530–640 MB/s rested, ~290–300 MB/s once its
+  write cache is spent by repeated 10 GiB runs. The overlapped
+  writer's field performance is unknown; 0.3.3 keeps the proven
+  synchronous writer. Process fix adopted: field executables ship
+  under versioned filenames and identity is checked with
+  `--version` before any timed run.
 # Quality — TextSwell 0.3.0
 
 ## 0.3.0 parallel generation — verified (VM), field run owed
@@ -109,9 +112,9 @@
   of 640.1 MB/s with 8 generator threads (auto) — 3.1× the 0.2.0
   field run (0:49, 207.5 MB/s), exact size, 21 needle placements +
   index, stream SHA-256 `b6a6ca0a…`. Parallel generation is therefore
-  field-verified as the right lever; the remaining known ceilings are
-  the synchronous single-write path (queue depth 1) and the
-  sequencer's per-block newline scan, both addressed in 0.3.1.
+  field-verified as the right lever. (Later runs of this same
+  binary, mislabelled at the time as tests of newer builds, are
+  recorded in the 0.3.1 section's correction.)
 
 # Quality — TextSwell 0.2.0
 
