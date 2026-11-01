@@ -82,6 +82,10 @@ mod win {
     /// queued asynchronously — the normal overlapped path.
     pub const ERROR_IO_PENDING: u32 = 997;
 
+    /// `GetOverlappedResult` with `wait = 0` returns 0 with this error
+    /// while the operation is still running.
+    pub const ERROR_IO_INCOMPLETE: u32 = 996;
+
     /// Mirrors the Win32 `OVERLAPPED` structure (x86_64 layout).
     #[repr(C)]
     pub struct Overlapped {
@@ -822,7 +826,7 @@ fn parse_bool(text: &str) -> Option<bool> {
 
 fn print_help() {
     let text = "\
-TextSwell - largetxt-gen 0.3.1
+TextSwell - largetxt-gen 0.3.2
 Generate massive test files that stress large-file text/hex editors.
 
 USAGE:
@@ -911,7 +915,7 @@ fn parse_args() -> Result<Config, (String, i32)> {
                 return Err((String::new(), 0));
             }
             "-V" | "--version" => {
-                return Err(("largetxt-gen 0.3.1\n".to_string(), 0));
+                return Err(("largetxt-gen 0.3.2\n".to_string(), 0));
             }
             "-s" | "--size" => {
                 let v = take_value(&mut i, "--size")?;
@@ -1191,6 +1195,21 @@ impl OutputFile {
                     &mut info as *mut win::FileAllocationInfo as *mut std::ffi::c_void,
                     std::mem::size_of::<win::FileAllocationInfo>() as u32,
                 );
+                // Pre-size the end-of-file as well as the allocation.
+                // With overlapped writes this is the difference between
+                // full speed and a crawl: a write that extends the file
+                // is serialized by NTFS to maintain the valid-data
+                // length, which collapses the write queue back to
+                // depth one. Inside a pre-sized EOF every write is a
+                // plain overwrite and they complete concurrently. The
+                // run still truncates to the exact requested size at
+                // the end. Failure is not fatal (the writes extend the
+                // file correctly, just slower).
+                let mut pos: i64 = 0;
+                if win::SetFilePointerEx(handle, alloc_bytes as i64, &mut pos, win::FILE_BEGIN) != 0
+                {
+                    let _ = win::SetEndOfFile(handle);
+                }
                 // Allocation info can move the file pointer on some
                 // filesystems; pin it back to the start.
                 let mut pos: i64 = 0;
@@ -1319,6 +1338,53 @@ impl OutputFile {
         {
             self.os_in_flight = self.os_in_flight.saturating_sub(1);
             return Ok(());
+        }
+    }
+
+    /// Non-blocking reap: if the oldest outstanding write has
+    /// completed, reap it (verifying its byte count) and return
+    /// `Some` of the outcome; if it is still running, return `None`
+    /// and leave it queued. Lets the writer feed its queue instead of
+    /// waiting on the drive when more blocks are ready to submit.
+    fn try_finish_oldest(&mut self) -> Option<Result<(), String>> {
+        #[cfg(windows)]
+        unsafe {
+            if self.pending_os.is_empty() {
+                return None;
+            }
+            let (mut ov, want) = self.pending_os.pop_front().expect("checked non-empty");
+            let mut got: u32 = 0;
+            let ok = win::GetOverlappedResult(
+                self.handle,
+                &mut *ov as *mut win::Overlapped,
+                &mut got,
+                0,
+            );
+            if ok == 0 {
+                let err = win::last_error();
+                if err == win::ERROR_IO_INCOMPLETE {
+                    // Still running: put it back at the head.
+                    self.pending_os.push_front((ov, want));
+                    return None;
+                }
+                win::CloseHandle(ov.event);
+                return Some(Err(format!("overlapped write failed (Win32 error {err})")));
+            }
+            win::CloseHandle(ov.event);
+            if got != want {
+                return Some(Err(format!(
+                    "overlapped write landed {got} of {want} bytes"
+                )));
+            }
+            return Some(Ok(()));
+        }
+        #[cfg(not(windows))]
+        {
+            if self.os_in_flight == 0 {
+                return None;
+            }
+            self.os_in_flight -= 1;
+            return Some(Ok(()));
         }
     }
 
@@ -2732,8 +2798,8 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
     }
     let pool = std::sync::Arc::new(BlockPool::new(pool_buffers));
     let (done_tx, done_rx) = sync_channel::<BlockMsg>(pool_blocks);
-    let (gen_tx, gen_rx) = sync_channel::<BlockMsg>(2);
-    let (hash_tx, hash_rx) = sync_channel::<BlockMsg>(2);
+    let (gen_tx, gen_rx) = sync_channel::<BlockMsg>(8);
+    let (hash_tx, hash_rx) = sync_channel::<BlockMsg>(8);
     let (hits_tx, hits_rx) = channel::<Vec<NeedleHit>>();
     let (digest_tx, digest_rx) = channel::<String>();
     let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -2807,17 +2873,51 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
             }
             continue;
         }
-        // Reap the oldest finished write, then count and recycle it.
-        if let Err(e) = output.finish_oldest() {
-            write_error = Some(e);
-            break;
+        // Reap the oldest write once it has finished. If it is still
+        // running, prefer feeding the queue over waiting on it: pull
+        // the next block and loop back to submit it. Only when nothing
+        // more can arrive (stream ended) or be accepted (queue full)
+        // is a blocking reap the right move.
+        let mut reaped = false;
+        match output.try_finish_oldest() {
+            Some(Ok(())) => reaped = true,
+            Some(Err(e)) => {
+                write_error = Some(e);
+                break;
+            }
+            None => {
+                if stream_ended || output.in_flight() >= MAX_WRITES_IN_FLIGHT {
+                    match output.finish_oldest() {
+                        Ok(()) => reaped = true,
+                        Err(e) => {
+                            write_error = Some(e);
+                            break;
+                        }
+                    }
+                } else {
+                    match hash_rx.recv() {
+                        Ok(msg) => {
+                            if let Err(e) =
+                                output.begin_write(&msg.block.as_slice()[..msg.write_len])
+                            {
+                                write_error = Some(e);
+                                break;
+                            }
+                            pending.push_back(msg);
+                        }
+                        Err(_) => stream_ended = true,
+                    }
+                }
+            }
         }
-        let msg = pending
-            .pop_front()
-            .expect("in-flight count and pending queue disagree");
-        written += msg.logical as u64;
-        let BlockMsg { block, .. } = msg;
-        pool.put(block);
+        if reaped {
+            let msg = pending
+                .pop_front()
+                .expect("in-flight count and pending queue disagree");
+            written += msg.logical as u64;
+            let BlockMsg { block, .. } = msg;
+            pool.put(block);
+        }
 
         // Throttled progress: at most once every 100 ms, plus the final
         // state, so the console never becomes the bottleneck.
