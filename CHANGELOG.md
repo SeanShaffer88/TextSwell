@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.2 — 2026-11-01
+
+Fix for the 0.3.1 field regression. **Output remains byte-identical
+to 0.3.0/0.3.1 for every profile and setting** (verified by direct
+comparison, including needle indexes).
+
+- **Pre-sized end-of-file on Windows**: 0.3.1's field run was slower
+  than 0.3.0 (299 vs 640 MB/s) despite correct output. Cause: the
+  file's end-of-file was still 0 when writing began (only its
+  allocation was pre-set), so every overlapped write extended the
+  file — and NTFS serializes extending writes to maintain the
+  valid-data length, collapsing the write queue to depth one. The
+  file is now sized to its final padded length at creation, so
+  writes are plain overwrites that complete concurrently; the run
+  still truncates to the exact requested size at the end. (Side
+  effect: the file shows its full size from the start.)
+- **Non-blocking reap first**: the writer now checks for completed
+  writes without waiting, and only blocks on a reap when the stream
+  has ended or the queue is full — previously it could wait on the
+  drive while finished blocks sat unsubmitted.
+- Deeper sequencer/hasher queues (2 → 8 blocks of slack).
+
 ## 0.3.1 — 2026-11-01
 
 Write-path slice: same bytes, deeper write queue. **Output is

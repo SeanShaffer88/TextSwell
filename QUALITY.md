@@ -1,3 +1,20 @@
+# Quality — TextSwell 0.3.2
+
+## 0.3.2 regression fix — verified (VM), field run owed
+
+- **What changed**: Windows create now pre-sizes the file's
+  end-of-file to the padded total (not just its allocation), so
+  overlapped writes are overwrites inside a sized file rather than
+  serialized extending writes; writer reaps non-blocking-first and
+  feeds its queue before waiting; stage queues deepened 2 → 8.
+- **Byte-identity**: A/B vs the 0.3.0 binary at 37 MiB — all six
+  profiles plus needle+null, threads 1/4, LF, custom line-len:
+  identical files and indexes, 10/10.
+- **Gate**: 22/22 tests, clippy clean host + windows-gnu, fmt clean.
+- **Field verification owed**: the deciding run is the owner's
+  10 GiB needle-bench — 0.3.2 must beat 299.1 MB/s (0.3.1) and
+  ideally the 640.1 MB/s 0.3.0 mark, with SHA `b6a6ca0a…` unchanged.
+
 # Quality — TextSwell 0.3.1
 
 ## 0.3.1 write-path slice — verified (VM), field run owed
@@ -12,11 +29,18 @@
   threads 1 and 4, LF eol, and custom line-len cases: file SHA-256
   and `.index` contents identical in all 10 cases.
 - **Gate**: 22/22 tests (incl. new SWAR adversarial-count test),
-  clippy clean on host and windows-gnu targets, fmt clean. The
-  Windows overlapped path compiles and links here; its runtime
-  behaviour is **Unverified until the owner's field run** — the
-  deciding numbers are his 10 GiB needle-bench (0.3.0 field mark:
-  0:16, 640.1 MB/s) and the exact-size/index checks in the summary.
+  clippy clean on host and windows-gnu targets, fmt clean.
+- **Field run (2026-11-01): correctness pass, speed REGRESSION.**
+  Output SHA-256 `b6a6ca0a…` — identical to the 0.3.0 run, exact
+  size, 21 needles: the byte-identity promise held in the field.
+  But the run took 0:34 at 299.1 MB/s against 0.3.0's 0:16 /
+  640.1 MB/s. Diagnosis: the file's end-of-file was still 0 at
+  create (only allocation was pre-set), so every overlapped write
+  was an *extending* write; NTFS serializes those to maintain the
+  valid-data length across concurrent writes, collapsing the queue
+  depth the slice was built to create (plus the writer reaped
+  blocking-style, starving its own queue). 0.3.2 pre-sizes the EOF
+  at create and makes reaping non-blocking-first.
 
 # Quality — TextSwell 0.3.0
 
