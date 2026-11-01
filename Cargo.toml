@@ -1,0 +1,28 @@
+[package]
+name = "textswell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Zero-dependency Windows CLI that generates massive test files to stress-test large-file text and hex editors"
+repository = "https://github.com/SeanShaffer88/TextSwell"
+homepage = "https://github.com/SeanShaffer88/TextSwell"
+keywords = ["cli", "benchmark", "large-file", "test-data", "windows"]
+categories = ["command-line-utilities", "development-tools::testing"]
+readme = "README.md"
+
+# The binary is called largetxt-gen regardless of the package/repo name
+# (TextSwell). There are no dependencies at all: the [dependencies] section
+# is intentionally absent. All Windows work goes through raw
+# `extern "system"` declarations against kernel32.dll in src/main.rs.
+[[bin]]
+name = "largetxt-gen"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# panic = "abort" is deliberately NOT set: unwinding costs nothing in this
+# tool (it never panics on the hot path) and keeping the default makes
+# crash diagnostics on Windows useful.
