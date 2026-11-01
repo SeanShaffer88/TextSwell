@@ -63,6 +63,17 @@ environment; **Unverified** means only the target machine can settle it.
     generation + SHA-256 included.
   - Usage errors exit 1 with a clear message; `--help`/`--version` exit 0.
 
+## v0.2.0 release packaging (2026-11-01)
+
+Full V2.0 matrix built locally from the published tree: NSIS
+`TextSwell-v0.2.0-x64-Setup.exe` (302,359 B), wixl-built
+`TextSwell-v0.2.0-x64-Setup.msi` (255,488 B), `TextSwell-v0.2.0-x64-Portable.zip`
+(235,220 B), plus `SHA256SUMS.txt`. The MSI was verified by extraction: it
+installs the byte-identical release exe (SHA-256 `0f5c626c…`) with README
+and LICENSE under Program Files\TextSwell, ProductVersion 0.2.0. The
+installers themselves have not yet been run on Windows — that check is
+owed on the owner's machine. Installer sources live in `installer/`.
+
 ## Field-verified on Windows 11 (2026-11-01, owner's machine)
 
 - **Full unbuffered run completed**: `needle-bench`, 10 GiB,
