@@ -4,7 +4,7 @@
      The File Source paths are relative to the staging directory the build
      runs in (largetxt-gen.exe, README.md, LICENSE staged together). -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="*" Name="TextSwell" Language="1033" Version="0.2.0"
+  <Product Id="*" Name="TextSwell" Language="1033" Version="0.3.3"
            Manufacturer="Sean Shaffer"
            UpgradeCode="FE91485B-A18B-4564-B9CE-DDE488D19E43">
     <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"
