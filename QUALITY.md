@@ -33,17 +33,30 @@ environment; **Unverified** means only the target machine can settle it.
     generation + SHA-256 included.
   - Usage errors exit 1 with a clear message; `--help`/`--version` exit 0.
 
-## Unverified (needs a Windows 11 machine)
+## Field-verified on Windows 11 (2026-11-01, owner's machine)
 
-- The Win32 unbuffered path actually running on Windows 11: `CreateFileW`
-  with `FILE_FLAG_NO_BUFFERING`, `FILE_ALLOCATION_INFO` pre-allocation, and
-  the pad-then-truncate finish on a real NTFS volume.
-- NVMe throughput (the 2.5–5.0 GB/s band is a property of the target drive;
-  development-VM numbers do not transfer).
+- **Full unbuffered run completed**: `needle-bench`, 10 GiB,
+  `--unbuffered true`, default seed — the `CreateFileW`
+  `FILE_FLAG_NO_BUFFERING` path, pre-allocation, and pad-then-truncate
+  finish all worked on a real NTFS volume. Final size exactly
+  10,737,418,240 bytes, elapsed 1:17, SHA-256
+  `7bd8222a5797d404630b5e1a9fcd6fb008a7ed72b5b6981076fb16deccf48e24`,
+  **21 needle placements** recorded (offsets 0 through 20 × 500 MiB) with
+  the `velo-10g.txt.index` sidecar written.
+- **Throughput honesty**: average 132.2 MB/s on that run. The line-shaped
+  profiles are bound by single-threaded generation + SHA-256, not by the
+  disk — on a fast NVMe drive they will not reach raw write bandwidth.
+  The stream profiles (`infinite-line`, `dirty-hex`) carry far less
+  per-byte work and are the right choice for a pure bandwidth measure;
+  their Windows numbers are still unmeasured.
+
+## Unverified
+
 - Working set on Windows (expected to match the ~12 MiB shape: one 4 MiB
   block plus staging and runtime).
+- Stream-profile throughput on a real NVMe drive.
 - The MSVC static-CRT build running on a clean Windows install with no
-  redistributable present.
+  redistributable present (the field run used the MinGW build).
 
 ## Scorecard (Elite prompt §17 shape)
 
