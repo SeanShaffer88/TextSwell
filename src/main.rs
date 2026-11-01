@@ -76,6 +76,35 @@ mod win {
     pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     pub const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
     pub const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+    /// `WriteFile` returning 0 with this error means the operation is
+    /// queued asynchronously — the normal overlapped path.
+    pub const ERROR_IO_PENDING: u32 = 997;
+
+    /// Mirrors the Win32 `OVERLAPPED` structure (x86_64 layout).
+    #[repr(C)]
+    pub struct Overlapped {
+        pub internal: usize,
+        pub internal_high: usize,
+        pub offset: u32,
+        pub offset_high: u32,
+        pub _reserved: u32,
+        pub event: Handle,
+    }
+
+    impl Overlapped {
+        pub fn new(offset: u64, event: Handle) -> Overlapped {
+            Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: offset as u32,
+                offset_high: (offset >> 32) as u32,
+                _reserved: 0,
+                event,
+            }
+        }
+    }
 
     pub const MEM_COMMIT: u32 = 0x0000_1000;
     pub const MEM_RESERVE: u32 = 0x0000_2000;
@@ -110,6 +139,18 @@ mod win {
             overlapped: *mut c_void,
         ) -> i32;
         pub fn CloseHandle(object: Handle) -> i32;
+        pub fn CreateEventW(
+            event_attributes: *mut c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> Handle;
+        pub fn GetOverlappedResult(
+            file: Handle,
+            overlapped: *mut Overlapped,
+            number_of_bytes_transferred: *mut u32,
+            wait: i32,
+        ) -> i32;
         pub fn FlushFileBuffers(file: Handle) -> i32;
         pub fn SetFilePointerEx(
             file: Handle,
@@ -781,7 +822,7 @@ fn parse_bool(text: &str) -> Option<bool> {
 
 fn print_help() {
     let text = "\
-TextSwell - largetxt-gen 0.3.0
+TextSwell - largetxt-gen 0.3.1
 Generate massive test files that stress large-file text/hex editors.
 
 USAGE:
@@ -870,7 +911,7 @@ fn parse_args() -> Result<Config, (String, i32)> {
                 return Err((String::new(), 0));
             }
             "-V" | "--version" => {
-                return Err(("largetxt-gen 0.3.0\n".to_string(), 0));
+                return Err(("largetxt-gen 0.3.1\n".to_string(), 0));
             }
             "-s" | "--size" => {
                 let v = take_value(&mut i, "--size")?;
@@ -1083,8 +1124,21 @@ impl Drop for AlignedBlock {
 struct OutputFile {
     #[cfg(windows)]
     handle: win::Handle,
+    /// Next overlapped write offset (Windows writes are all overlapped,
+    /// so offsets are explicit rather than pointer-based).
+    #[cfg(windows)]
+    next_offset: u64,
+    /// Outstanding overlapped writes, oldest first: the OVERLAPPED and
+    /// the byte count its completion must report.
+    #[cfg(windows)]
+    pending_os: std::collections::VecDeque<(Box<win::Overlapped>, u32)>,
     #[cfg(not(windows))]
     file: std::fs::File,
+    /// Writes submitted but not yet reaped (non-Windows writes complete
+    /// synchronously inside `begin_write`; this counter just mirrors
+    /// the accounting so `run` is platform-neutral).
+    #[cfg(not(windows))]
+    os_in_flight: usize,
 }
 
 impl OutputFile {
@@ -1098,7 +1152,9 @@ impl OutputFile {
         #[cfg(windows)]
         unsafe {
             let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut flags = win::FILE_ATTRIBUTE_NORMAL | win::FILE_FLAG_SEQUENTIAL_SCAN;
+            let mut flags = win::FILE_ATTRIBUTE_NORMAL
+                | win::FILE_FLAG_SEQUENTIAL_SCAN
+                | win::FILE_FLAG_OVERLAPPED;
             if unbuffered {
                 flags |= win::FILE_FLAG_NO_BUFFERING;
             }
@@ -1117,7 +1173,11 @@ impl OutputFile {
                     win::last_error()
                 ));
             }
-            let out = OutputFile { handle };
+            let out = OutputFile {
+                handle,
+                next_offset: 0,
+                pending_os: std::collections::VecDeque::new(),
+            };
             // Zero-fragmentation pre-allocation. Failure is not fatal: some
             // filesystems (FAT, network shares) reject allocation info, and
             // the writes themselves will extend the file correctly anyway.
@@ -1151,47 +1211,122 @@ impl OutputFile {
                 let _ = file.seek(std::io::SeekFrom::Start(0));
             }
             let _ = unbuffered;
-            return Ok(OutputFile { file });
+            return Ok(OutputFile {
+                file,
+                os_in_flight: 0,
+            });
         }
     }
 
-    /// Writes every byte of `data`. With unbuffered I/O the caller
-    /// guarantees `data.len()` is a sector multiple and the buffer/offset
-    /// alignment holds; `WriteFile` may still write partially, so loop.
+    /// Writes every byte of `data` synchronously (non-Windows path;
+    /// Windows writes are all overlapped — see `begin_write`).
+    #[cfg(not(windows))]
     fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
+        use std::io::Write as _;
+        self.file
+            .write_all(data)
+            .map_err(|e| format!("write failed: {e}"))
+    }
+
+    /// Submits one write of `data` at the current write offset. On
+    /// Windows this issues an overlapped `WriteFile` and returns
+    /// immediately — the caller must keep `data` alive until the write
+    /// is reaped by `finish_oldest`. On other platforms the write
+    /// completes synchronously before this returns.
+    fn begin_write(&mut self, data: &[u8]) -> Result<(), String> {
         #[cfg(windows)]
         unsafe {
-            let mut written_total = 0usize;
-            while written_total < data.len() {
-                let remaining = data.len() - written_total;
-                let chunk = std::cmp::min(remaining, u32::MAX as usize) as u32;
-                let mut written: u32 = 0;
-                let ok = win::WriteFile(
-                    self.handle,
-                    data.as_ptr().add(written_total),
-                    chunk,
-                    &mut written,
-                    std::ptr::null_mut(),
-                );
-                if ok == 0 {
+            let event = win::CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null());
+            if event.is_null() {
+                return Err(format!(
+                    "CreateEventW failed (Win32 error {})",
+                    win::last_error()
+                ));
+            }
+            let mut ov = Box::new(win::Overlapped::new(self.next_offset, event));
+            let ok = win::WriteFile(
+                self.handle,
+                data.as_ptr(),
+                data.len() as u32,
+                std::ptr::null_mut(),
+                &mut *ov as *mut win::Overlapped as *mut std::ffi::c_void,
+            );
+            if ok == 0 {
+                let err = win::last_error();
+                if err != win::ERROR_IO_PENDING {
+                    win::CloseHandle(event);
                     return Err(format!(
-                        "WriteFile failed after {written_total} bytes (Win32 error {})",
-                        win::last_error()
+                        "WriteFile failed at offset {} (Win32 error {})",
+                        self.next_offset, err
                     ));
                 }
-                if written == 0 {
-                    return Err("WriteFile reported 0 bytes written".to_string());
-                }
-                written_total += written as usize;
+            }
+            self.next_offset += data.len() as u64;
+            self.pending_os.push_back((ov, data.len() as u32));
+            return Ok(());
+        }
+        #[cfg(not(windows))]
+        {
+            self.write_all(data)?;
+            self.os_in_flight += 1;
+            return Ok(());
+        }
+    }
+
+    /// How many submitted writes have not been reaped yet.
+    fn in_flight(&self) -> usize {
+        #[cfg(windows)]
+        {
+            return self.pending_os.len();
+        }
+        #[cfg(not(windows))]
+        {
+            return self.os_in_flight;
+        }
+    }
+
+    /// Waits for the oldest outstanding write to complete and verifies
+    /// it landed in full. Callers recycle the corresponding block only
+    /// after this returns — before that, the kernel may still be
+    /// reading the buffer.
+    fn finish_oldest(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        unsafe {
+            let Some((mut ov, want)) = self.pending_os.pop_front() else {
+                return Ok(());
+            };
+            let mut got: u32 = 0;
+            let ok = win::GetOverlappedResult(
+                self.handle,
+                &mut *ov as *mut win::Overlapped,
+                &mut got,
+                1,
+            );
+            let event = ov.event;
+            win::CloseHandle(event);
+            if ok == 0 {
+                return Err(format!(
+                    "overlapped write failed (Win32 error {})",
+                    win::last_error()
+                ));
+            }
+            if got != want {
+                return Err(format!("overlapped write landed {got} of {want} bytes"));
             }
             return Ok(());
         }
         #[cfg(not(windows))]
         {
-            return self
-                .file
-                .write_all(data)
-                .map_err(|e| format!("write failed: {e}"));
+            self.os_in_flight = self.os_in_flight.saturating_sub(1);
+            return Ok(());
+        }
+    }
+
+    /// Reaps every outstanding write, ignoring errors. Used on shutdown
+    /// paths so no buffer is freed while the kernel may still touch it.
+    fn drain_all(&mut self) {
+        while self.in_flight() > 0 {
+            let _ = self.finish_oldest();
         }
     }
 
@@ -2127,7 +2262,7 @@ const NULL_STREAM_SALT: u64 = 0xE703_7ED1_A0B4_28DB;
 
 /// How many generator workers to run: the flag value when given, else
 /// two fewer than the machine's core count (the hasher and the
-/// writer/sequencer want cores too), clamped to 1..=8.
+/// writer/sequencer want cores too), clamped to 1..=16.
 fn resolve_threads(cfg: &Config) -> usize {
     if cfg.threads > 0 {
         return cfg.threads.min(64);
@@ -2136,7 +2271,7 @@ fn resolve_threads(cfg: &Config) -> usize {
         .map(|n| n.get())
         .unwrap_or(1);
     if cores >= 4 {
-        (cores - 2).min(8)
+        (cores - 2).min(16)
     } else {
         1
     }
@@ -2228,9 +2363,24 @@ fn apply_null_rate(rng: &mut Xoshiro256PlusPlus, block: &mut [u8], pct: f64) {
     }
 }
 
-/// Counts `\n` bytes — the line counter the index and nothing else uses.
+/// Counts `\n` bytes — the line counter the index and nothing else
+/// uses. SWAR: eight bytes per step, using the borrow-free per-byte
+/// equality mask (a byte of `w ^ 0x0A..` is zero exactly where the byte
+/// equals `\n`; the `0x7F`-addition form flags those bytes without any
+/// cross-byte borrow, so it is exact for arbitrary content).
 fn count_newlines(block: &[u8]) -> u64 {
-    block.iter().filter(|&&b| b == b'\n').count() as u64
+    const TARGET: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let mut count: u64 = 0;
+    let (chunks, remainder) = block.as_chunks::<8>();
+    for chunk in chunks {
+        let w = u64::from_le_bytes(*chunk);
+        let y = w ^ TARGET;
+        let hits = !(((y & LOW7) + LOW7) | y) & HIGH;
+        count += hits.count_ones() as u64;
+    }
+    count + remainder.iter().filter(|&&b| b == b'\n').count() as u64
 }
 
 // ===========================================================================
@@ -2610,19 +2760,61 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
     };
     let hash_thread = std::thread::spawn(move || hasher_loop(gen_rx, hash_tx, digest_tx));
 
-    // Stage 3 — writing, on this thread. Blocks arrive in order; each is
-    // written, counted for progress, and returned to the pool.
+    // Stage 3 — writing, on this thread. Blocks arrive in order; up to
+    // MAX_WRITES_IN_FLIGHT overlapped writes may be outstanding at
+    // once (the drive's queue depth is what turns into throughput on
+    // NVMe). A block returns to the pool only after its write has been
+    // reaped, never before — the kernel may still be reading it.
+    const MAX_WRITES_IN_FLIGHT: usize = 4;
+    let mut pending: std::collections::VecDeque<BlockMsg> = std::collections::VecDeque::new();
+    let mut stream_ended = false;
     let mut written: u64 = 0;
     let mut last_print_at = f64::NEG_INFINITY;
     let mut last_print_bytes: u64 = 0;
     let mut smoothed_rate: f64 = 0.0;
     let mut write_error: Option<String> = None;
 
-    while let Ok(msg) = hash_rx.recv() {
-        if let Err(e) = output.write_all(&msg.block.as_slice()[..msg.write_len]) {
+    'writer: loop {
+        // Top up the in-flight writes.
+        while output.in_flight() < MAX_WRITES_IN_FLIGHT && !stream_ended {
+            match hash_rx.try_recv() {
+                Ok(msg) => {
+                    if let Err(e) = output.begin_write(&msg.block.as_slice()[..msg.write_len]) {
+                        write_error = Some(e);
+                        break 'writer;
+                    }
+                    pending.push_back(msg);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => stream_ended = true,
+            }
+        }
+        if output.in_flight() == 0 {
+            if stream_ended {
+                break;
+            }
+            // Nothing in flight and nothing queued: wait for the next
+            // block instead of spinning.
+            match hash_rx.recv() {
+                Ok(msg) => {
+                    if let Err(e) = output.begin_write(&msg.block.as_slice()[..msg.write_len]) {
+                        write_error = Some(e);
+                        break;
+                    }
+                    pending.push_back(msg);
+                }
+                Err(_) => stream_ended = true,
+            }
+            continue;
+        }
+        // Reap the oldest finished write, then count and recycle it.
+        if let Err(e) = output.finish_oldest() {
             write_error = Some(e);
             break;
         }
+        let msg = pending
+            .pop_front()
+            .expect("in-flight count and pending queue disagree");
         written += msg.logical as u64;
         let BlockMsg { block, .. } = msg;
         pool.put(block);
@@ -2647,12 +2839,15 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
     }
 
     if let Some(e) = write_error {
-        // Cascade the shutdown: flag the workers, drop the hash queue so
-        // the hasher's next send fails, and close the pool so every
-        // worker waiting for a buffer wakes and exits; then join all
+        // Reap every outstanding write before anything is freed, then
+        // cascade the shutdown: flag the workers, drop the queues so
+        // the sequencer and hasher fail their next send, close the
+        // pool so workers waiting for a buffer wake, and join all
         // threads before reporting the error.
+        output.drain_all();
+        drop(pending);
         stop.store(true, Ordering::Relaxed);
-        drop(hash_rx);
+        drop(hash_rx); // the hasher's next send now fails, unwinding stages
         pool.close();
         for t in worker_threads {
             let _ = t.join();
@@ -2662,8 +2857,8 @@ fn run(cfg: &Config) -> Result<RunSummary, String> {
         return Err(e);
     }
 
-    // Normal completion: the queues have drained and closed. Collect the
-    // digest and the needle hits, then join.
+    // Normal completion: every write has been reaped and the queues
+    // have drained and closed. Collect the digest and needle hits.
     let sha256_hex = digest_rx
         .recv()
         .map_err(|_| "hash stage ended without a digest".to_string())?;
@@ -3193,6 +3388,23 @@ mod tests {
             assert_eq!(carry, 0);
         }
         data
+    }
+
+    #[test]
+    fn swar_newline_count_matches_naive() {
+        // Adversarial content for the SWAR mask: bytes that become
+        // 0x00/0x01 after the XOR (0x0A itself and 0x0B) in every
+        // position, plus a long PRNG stream from the real generator.
+        let mut data: Vec<u8> = Vec::new();
+        for i in 0..64u8 {
+            data.extend_from_slice(&[b'\n', 0x0B, 0x00, 0xFF, i, b'\n', 0x0B, b'a']);
+        }
+        data.extend_from_slice(&generate(Profile::DirtyHex, 5, 100_000));
+        data.extend_from_slice(b"tail without full chunk\n\n");
+        let naive = data.iter().filter(|&&b| b == b'\n').count() as u64;
+        assert_eq!(count_newlines(&data), naive);
+        assert_eq!(count_newlines(&[]), 0);
+        assert_eq!(count_newlines(&[b'\n'; 8]), 8);
     }
 
     #[test]
