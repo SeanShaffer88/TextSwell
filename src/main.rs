@@ -30,8 +30,8 @@
 //! * **Unbuffered, pre-allocated writes on Windows.** `CreateFileW` with
 //!   `FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN`, NTFS
 //!   pre-allocation through `SetFileInformationByHandle`
-//!   (`FILE_ALLOCATION_INFO`), and a final `SetFilePointerEx` +
-//!   `SetEndOfFile` truncation so the file ends at the *exact* requested
+//!   (`FILE_ALLOCATION_INFO`), and a final `FileEndOfFileInfo`
+//!   update so the file ends at the *exact* requested
 //!   byte even though unbuffered writes must be sector-sized.
 //! * **Deterministic.** The same `--seed`, size, profile, and flags always
 //!   produce byte-identical output and therefore the same SHA-256.
@@ -116,7 +116,6 @@ mod win {
             new_file_pointer: *mut i64,
             move_method: u32,
         ) -> i32;
-        pub fn SetEndOfFile(file: Handle) -> i32;
         pub fn SetFileInformationByHandle(
             file: Handle,
             file_information_class: i32,
@@ -1254,22 +1253,22 @@ impl OutputFile {
     }
 
     /// Truncates (or extends) the file to exactly `size` bytes:
-    /// `SetFilePointerEx` to the size, then `SetEndOfFile`. This is how an
+    /// `FileEndOfFileInfo` sets the size without an unaligned seek. This is how an
     /// unbuffered run — whose last write was padded up to a sector boundary
     /// — ends at the exact requested byte.
     fn truncate_to(&mut self, size: u64) -> Result<(), String> {
         #[cfg(windows)]
         unsafe {
-            let mut pos: i64 = 0;
-            if win::SetFilePointerEx(self.handle, size as i64, &mut pos, win::FILE_BEGIN) == 0 {
+            let mut end_of_file = size as i64;
+            if win::SetFileInformationByHandle(
+                self.handle,
+                6, // FileEndOfFileInfo
+                &mut end_of_file as *mut i64 as *mut std::ffi::c_void,
+                std::mem::size_of::<i64>() as u32,
+            ) == 0
+            {
                 return Err(format!(
-                    "SetFilePointerEx failed (Win32 error {})",
-                    win::last_error()
-                ));
-            }
-            if win::SetEndOfFile(self.handle) == 0 {
-                return Err(format!(
-                    "SetEndOfFile failed (Win32 error {})",
+                    "SetFileInformationByHandle(FileEndOfFileInfo) failed (Win32 error {})",
                     win::last_error()
                 ));
             }
@@ -3361,6 +3360,27 @@ mod tests {
         assert_eq!(count_newlines(&data), naive);
         assert_eq!(count_newlines(&[]), 0);
         assert_eq!(count_newlines(&[b'\n'; 8]), 8);
+    }
+
+    #[test]
+    fn exact_lengths_match_buffered_reference() {
+        for size in [1, 4095, 4096, 4097, 1_234_567] {
+            for unbuffered in [false, true] {
+                let path = std::env::temp_dir().join(format!(
+                    "textswell-length-{}-{size}-{unbuffered}.txt",
+                    std::process::id()
+                ));
+                let mut cfg = test_cfg(Profile::DirtyHex, 77);
+                cfg.output_path = path.to_string_lossy().into_owned();
+                cfg.size = size;
+                cfg.unbuffered = unbuffered;
+                run(&cfg).expect("exact-length run failed");
+                let bytes = std::fs::read(&path).unwrap();
+                assert_eq!(bytes.len() as u64, size);
+                assert_eq!(bytes, reference_stream(&cfg));
+                std::fs::remove_file(path).unwrap();
+            }
+        }
     }
 
     #[test]
