@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4 — 2026-11-03
+
+- Preserve the exact requested file length for unbuffered Windows output,
+  including partial sectors and empty files.
+
 ## 0.3.3 — 2026-11-01
 
 Writer reverted to the synchronous path. **Output remains
