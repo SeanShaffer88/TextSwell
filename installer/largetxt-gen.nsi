@@ -1,10 +1,10 @@
 ; TextSwell (largetxt-gen) - NSIS installer script
-; Builds TextSwell-v0.3.3-x64-Setup.exe
+; Builds TextSwell-v0.3.4-x64-Setup.exe
 ; Expects the release exe staged next to this script's build directory as
 ; "largetxt-gen.exe" (pass /DSTAGE=<dir> if it lives elsewhere).
 
 !ifndef VERSION
-  !define VERSION "0.3.3"
+  !define VERSION "0.3.4"
 !endif
 !ifndef STAGE
   !define STAGE "."

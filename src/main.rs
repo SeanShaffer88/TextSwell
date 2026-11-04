@@ -779,7 +779,7 @@ fn parse_bool(text: &str) -> Option<bool> {
 
 fn print_help() {
     let text = "\
-TextSwell - largetxt-gen 0.3.3
+TextSwell - largetxt-gen 0.3.4
 Generate massive test files that stress large-file text/hex editors.
 
 USAGE:
@@ -868,7 +868,7 @@ fn parse_args() -> Result<Config, (String, i32)> {
                 return Err((String::new(), 0));
             }
             "-V" | "--version" => {
-                return Err(("largetxt-gen 0.3.3\n".to_string(), 0));
+                return Err(("largetxt-gen 0.3.4\n".to_string(), 0));
             }
             "-s" | "--size" => {
                 let v = take_value(&mut i, "--size")?;
